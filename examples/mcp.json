@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "proxmox": {
+      "command": "node",
+      "args": ["C:/chemin/vers/pvemcp/dist/index.js"],
+      "env": {
+        "PROXMOX_URL": "https://192.168.1.10:8006",
+        "PROXMOX_CREDENTIALS_FILE": "C:/chemin/vers/pvemcp.token",
+        "PROXMOX_FINGERPRINT": "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+        "PROXMOX_AUDIT_LOG": "C:/chemin/vers/pvemcp-audit.jsonl"
+      }
+    }
+  }
+}
