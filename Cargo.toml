@@ -1,0 +1,45 @@
+[package]
+name = "pvemcp"
+version = "0.1.0"
+edition = "2024"
+description = "Serveur MCP pour Proxmox VE : couverture totale de l'API, gestion SSH et LXC, lecture seule par défaut."
+license = "MIT"
+rust-version = "1.88"
+
+[[bin]]
+name = "pvemcp"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+percent-encoding = "2"
+url = "2"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
+russh-sftp = "3"
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
+rand = "0.9"
+subtle = "2"
+indexmap = { version = "2", features = ["serde"] }
+hyper = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

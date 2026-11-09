@@ -1,9 +1,6 @@
-import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { sh } from '../src/ssh/index.js';
-import { pctExec, sampleScripts } from '../src/ssh/scripts.js';
 import { FAKE_SSH_PASSWORD, FakeSsh, ShellSandbox } from './fake-ssh.js';
 import { closeSsh, connectSsh, POSIX_SHELL, type SshHarness } from './ssh-harness.js';
 
@@ -13,6 +10,11 @@ import { closeSsh, connectSsh, POSIX_SHELL, type SshHarness } from './ssh-harnes
  * a real POSIX shell (dash where available), with a pct stub that executes what it is given. The
  * container commands record the arguments they get. Everything stays in a temp directory.
  */
+
+/** What a careful caller does to put a value in a command: the quoting of sh`` in the server. */
+function shQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
 
 /** Each one tries to break out by another route. If any ran, the marker file appears. */
 const HOSTILE: Array<[string, string]> = [
@@ -102,7 +104,7 @@ describe.skipIf(!POSIX_SHELL)('hostile input through the node shell, pct and the
     });
 
     it('arrives intact in the command itself, as text and not as code, when properly quoted by the caller', async () => {
-      const command = sh`spy ${payload}`;
+      const command = `spy ${shQuote(payload)}`;
       const res = await h.call('pve_lxc_exec', { vmid: 101, command });
       expect(res.isError).toBe(false);
       expect(sandbox.ctCalls('spy')[0]!.argv).toEqual(['spy', payload]);
@@ -270,52 +272,5 @@ describe.skipIf(!POSIX_SHELL)('hostile input through the node shell, pct and the
   });
 });
 
-describe.skipIf(!POSIX_SHELL)('every generated script', () => {
-  const scripts = Object.entries(sampleScripts());
-
-  it.each(scripts)('%s parses in a strict POSIX shell', (_name, script) => {
-    const res = spawnSync(POSIX_SHELL!.path, ['-n'], { input: script, encoding: 'utf8' });
-    expect(res.stderr).toBe('');
-    expect(res.status).toBe(0);
-  });
-
-  it.each(scripts)('%s also parses once carried by pct exec', (_name, script) => {
-    const res = spawnSync(POSIX_SHELL!.path, ['-n'], { input: pctExec(101, script), encoding: 'utf8' });
-    expect(res.stderr).toBe('');
-    expect(res.status).toBe(0);
-  });
-});
-
-describe('bash syntax', () => {
-  /** Dash already rejects most of it. These would slip through a parse, or are options dash does not check. */
-  const BASHISMS: Array<[string, RegExp]> = [
-    ['[[ ]]', /\[\[ /],
-    ['function keyword', /\bfunction\s+\w+/],
-    ['here string', /<<</],
-    ['ANSI-C quoting', /(?:^|\s)\$'/m],
-    ['process substitution', /[<>]\(/],
-    ['&> redirect', /&>/],
-    ['pipefail', /pipefail/],
-    ['source', /^\s*source\s/m],
-    ['echo with options', /\becho -[neE]\b/],
-    ['local', /^\s*local\s/m],
-    ['arrays', /\$\{\w+\[/],
-    ['pattern substitution', /\$\{\w+\/\//],
-    ['== in test', /\[ [^\]]*== /],
-    ['hard-coded bash', /\bbash\b/],
-  ];
-
-  it.each(Object.entries(sampleScripts()))('%s has none', (_name, script) => {
-    for (const [what, pattern] of BASHISMS) expect(pattern.test(script), what).toBe(false);
-  });
-});
-
-describe('pct syntax', () => {
-  it('builds pct exec the way the man page has it: vmid, then -- and the command', () => {
-    expect(pctExec(100, 'id')).toBe(`pct exec '100' -- sh -c 'id'`);
-  });
-
-  it('holds exactly one level of quoting around the script', () => {
-    expect(pctExec(100, `cat 'a b'`)).toBe(`pct exec '100' -- sh -c 'cat '\\''a b'\\'''`);
-  });
-});
+// The generated scripts themselves (POSIX parse, plain and through pct exec, no bash syntax, pct exec
+// syntax, byte for byte the same as the TypeScript version) are checked in src/ssh/scripts.rs.

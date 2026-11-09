@@ -1,7 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import type { AddressInfo } from 'node:net';
-import { catalog, findEndpoint, matchPath, type CatalogEndpoint, type HttpMethod } from '../src/catalog/index.js';
+import { catalog, findEndpoint, matchPath, type CatalogEndpoint, type HttpMethod } from './catalog.js';
 
 /**
  * A local stand-in for the Proxmox API. It answers the way the real one does: errors in the

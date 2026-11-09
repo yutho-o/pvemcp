@@ -12,14 +12,13 @@ Serveur [MCP](https://modelcontextprotocol.io) pour [Proxmox VE](https://www.pro
 
 ## Installation
 
-Il faut Node.js 20.10 ou plus récent. Les tests n'ont tourné que sous Node 26, sous Windows.
+Le serveur est un binaire Rust autonome, sans dépendance à l'exécution. Il faut Rust 1.88 ou plus récent pour le compiler.
 
 ```bash
-npm ci
-npm run build
+cargo build --release
 ```
 
-`npm` peut signaler que le script d'installation de `ssh2` n'a pas été exécuté. Il ne sert qu'à compiler une accélération facultative : `ssh2` fonctionne sans, en JavaScript pur.
+Le binaire est `target/release/pvemcp` (`pvemcp.exe` sous Windows). Le catalogue de l'API y est intégré : il peut être copié seul où l'on veut.
 
 ### Claude Code ou Claude Desktop
 
@@ -27,8 +26,7 @@ npm run build
 {
   "mcpServers": {
     "proxmox": {
-      "command": "node",
-      "args": ["C:/chemin/vers/pvemcp/dist/index.js"],
+      "command": "C:/chemin/vers/pvemcp/target/release/pvemcp.exe",
       "env": {
         "PROXMOX_URL": "https://192.168.1.10:8006",
         "PROXMOX_CREDENTIALS_FILE": "C:/chemin/vers/pvemcp.token",
@@ -151,7 +149,7 @@ Une faute de frappe dans une option de sécurité (`PROXMOX_ALLOW_WRITES=ture`) 
 ### Mode HTTP
 
 ```bash
-node dist/index.js --http --host 127.0.0.1 --port 8765
+pvemcp --http --host 127.0.0.1 --port 8765
 ```
 
 Le point d'accès est `/mcp`. Voir [Accès réseau](#accès-réseau).
@@ -211,7 +209,7 @@ Soit 740 outils au total : 669 pour l'API, 5 génériques, 13 composés, 53 pour
 Pour afficher la liste exacte de votre configuration (domaine, porte, nom), sans aucune connexion :
 
 ```powershell
-$env:PROXMOX_URL='https://pve:8006'; $env:PROXMOX_TOKEN='a@pam!b=c'; node dist/index.js --list-tools
+$env:PROXMOX_URL='https://pve:8006'; $env:PROXMOX_TOKEN='a@pam!b=c'; pvemcp --list-tools
 ```
 
 **Attention à la taille.** Un client qui charge tous les outils dans son contexte les paie à chaque échange. Mesures de `tools/list` (la conversion en jetons est une estimation grossière, à 4 octets par jeton) :
@@ -395,9 +393,8 @@ En mode `--http`, le serveur écoute sur `127.0.0.1` par défaut et refuse une a
 - **Aucun essai sur un vrai Proxmox.** Le faux serveur vérifie les noms et les types d'après le schéma. Il ne prouve pas que Proxmox accepte chaque valeur.
 - **Champs absents du schéma.** Certaines réponses y sont à peine décrites : `/nodes/{node}/replication` (`fail_count`, `error`, `last_sync`), `/cluster/tasks`, `rrddata`, `aplinfo`. Les outils composés lisent ces champs d'après ce que l'on sait de Proxmox. Si leurs noms diffèrent, un échec de réplication pourrait passer inaperçu de `pve_health_check`.
 - **`pct`, gestionnaires de paquets et systèmes d'init sont simulés.** Les commandes s'exécutent dans un vrai `dash`, avec des stubs qui enregistrent leurs arguments. Les options pour Alpine sont vérifiées contre une table écrite de mémoire, pas sous BusyBox.
-- **Windows et Node 26 seulement** pour les tests. Le SSH a aussi été testé contre un vrai OpenSSH 9.7 local, mais son `sshd` sous Windows n'applique pas le signal envoyé à une commande : la livraison du signal reste à prouver.
+- **Windows seulement** pour les tests. Le SSH a aussi été testé contre un vrai OpenSSH 9.7 local, mais son `sshd` sous Windows n'applique pas le signal envoyé à une commande : la livraison du signal reste à prouver.
 - **Deux tests sont ignorés sur la machine de développement** : les liens symboliques de fichiers sous `PROXMOX_LOCAL_DIR`, faute de droit pour en créer. Les répertoires liés et les jonctions sont testés.
-- `ssh2` n'expose pas l'envoi d'un signal après la fin de l'entrée : le code passe par une de ses fonctions internes, d'où la version figée en `~1.17`. Si elle change, le signal ne part plus, et le canal est quand même fermé.
 - Les expressions régulières du schéma (`pattern`) sont en Perl : elles sont montrées dans les descriptions, pas appliquées. Une valeur mal formée reçoit l'erreur de Proxmox.
 - La liste des secrets lisibles par `read_file` est une liste de refus, donc incomplète par nature.
 - Les plus anciennes versions de Proxmox n'ont pas tous les points d'API : un outil répond alors `not_supported`. Le catalogue vient de la version de la documentation téléchargée (`pve_mcp_info` donne sa date).
@@ -407,11 +404,16 @@ En mode `--http`, le serveur écoute sur `127.0.0.1` par défaut et refuse une a
 ## Développement
 
 ```bash
-npm test            # tests, contre test/fake-pve.ts et test/fake-ssh.ts
-npm run typecheck
-npm run build
+cargo test          # tests unitaires, dont la parité des outils avec reference/
+cargo build         # puis, pour les tests de bout en bout contre le binaire :
+npm ci
+npm test            # contre test/fake-pve.ts et test/fake-ssh.ts
 npm run catalog     # régénère src/catalog/endpoints.json depuis pve.proxmox.com
 ```
+
+Les tests de bout en bout (Node 20.10 ou plus récent) lancent le binaire comme le ferait un client MCP : celui de `PVEMCP_BIN`, sinon `target/release`, sinon `target/debug`. Après une régénération du catalogue, recompilez : il est intégré au binaire.
+
+`reference/` contient ce qu'annonçait la version TypeScript d'origine (outils, prompts, ressources, instructions, noms) : `cargo test` vérifie que le binaire annonce exactement la même chose.
 
 `node scripts/build-catalog.mjs --from apidoc.js` régénère le catalogue depuis une copie locale. Le fichier est analysé, jamais évalué, et le résultat est déterministe. Après une régénération, les tests repèrent toute méthode nouvelle sans porte attendue ni outil.
 

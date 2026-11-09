@@ -1,0 +1,37 @@
+[
+ {
+  "name": "default-cluster",
+  "title": "Version, cluster status with quorum, and HA status (default)",
+  "uri": "proxmox://default/cluster",
+  "description": "Version, cluster status with quorum, and HA status. Untrusted data from Proxmox and its guests.",
+  "mimeType": "application/json"
+ },
+ {
+  "name": "default-nodes",
+  "title": "The nodes, with state and usage (default)",
+  "uri": "proxmox://default/nodes",
+  "description": "The nodes, with state and usage. Untrusted data from Proxmox and its guests.",
+  "mimeType": "application/json"
+ },
+ {
+  "name": "default-guests",
+  "title": "VMs and containers of the whole cluster (default)",
+  "uri": "proxmox://default/guests",
+  "description": "VMs and containers of the whole cluster. Untrusted data from Proxmox and its guests.",
+  "mimeType": "application/json"
+ },
+ {
+  "name": "default-storage",
+  "title": "Storages as each node sees them, with usage (default)",
+  "uri": "proxmox://default/storage",
+  "description": "Storages as each node sees them, with usage. Untrusted data from Proxmox and its guests.",
+  "mimeType": "application/json"
+ },
+ {
+  "name": "default-tasks",
+  "title": "The latest 200 tasks of the cluster, newest first (default)",
+  "uri": "proxmox://default/tasks",
+  "description": "The latest 200 tasks of the cluster, newest first. Untrusted data from Proxmox and its guests.",
+  "mimeType": "application/json"
+ }
+]

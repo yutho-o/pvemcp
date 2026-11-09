@@ -1,8 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join, parse, sep } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join, sep } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { ProxmoxError } from '../src/proxmox/errors.js';
-import { resolveLocalPath } from '../src/proxmox/localpath.js';
 import { FakeSsh, ShellSandbox } from './fake-ssh.js';
 import { closeSsh, connectSsh, POSIX_SHELL, tempDir, type SshHarness } from './ssh-harness.js';
 
@@ -243,85 +241,4 @@ describe.skipIf(!POSIX_SHELL)('transfers through the tools', () => {
   });
 });
 
-const write = { mustExist: false };
-
-describe.runIf(IS_WINDOWS)('Windows paths', () => {
-  afterEach(closeSsh);
-
-  it('refuses another drive, and a path relative to another current directory', () => {
-    const dir = tempDir();
-    const drive = parse(dir).root[0]!.toUpperCase();
-    const other = drive === 'Z' ? 'Y' : 'Z';
-    expect(() => resolveLocalPath(dir, `${other}:\\Windows\\win.ini`, write)).toThrow(ProxmoxError);
-    expect(() => resolveLocalPath(dir, `${other}:relative.txt`, write)).toThrow(ProxmoxError);
-    // With the drive of the directory, node resolves it against the directory: it stays inside.
-    expect(resolveLocalPath(dir, `${drive}:relative.txt`, write).toLowerCase()).toBe(join(realpathSync(dir), 'relative.txt').toLowerCase());
-    expect(() => resolveLocalPath(dir, `\\Windows\\win.ini`, write)).toThrow(ProxmoxError);
-  });
-
-  it('refuses UNC and device paths', () => {
-    const dir = tempDir();
-    for (const path of ['\\\\server\\share\\x', '\\\\?\\C:\\Windows\\win.ini', '\\\\.\\PhysicalDrive0', '//server/share/x']) {
-      expect(() => resolveLocalPath(dir, path, write), path).toThrow(ProxmoxError);
-    }
-  });
-
-  it('takes another case of the directory for the same directory', () => {
-    const dir = realpathSync(tempDir());
-    writeFileSync(join(dir, 'a.txt'), 'x');
-    const expected = join(dir, 'a.txt').toLowerCase();
-    expect(resolveLocalPath(dir, join(dir.toUpperCase(), 'a.txt'), { mustExist: true }).toLowerCase()).toBe(expected);
-    expect(resolveLocalPath(dir, join(dir.toLowerCase(), 'a.txt'), { mustExist: true }).toLowerCase()).toBe(expected);
-    expect(resolveLocalPath(dir.toUpperCase(), join(dir, 'a.txt'), { mustExist: true }).toLowerCase()).toBe(expected);
-    expect(resolveLocalPath(dir, join(dir.toUpperCase(), 'new.txt'), write).toLowerCase()).toBe(join(dir, 'new.txt').toLowerCase());
-  });
-
-  it('is not fooled by case when leaving the directory', () => {
-    const parent = realpathSync(tempDir());
-    const dir = join(parent, 'inner');
-    const sibling = join(parent, 'INNER-other');
-    mkdirSync(dir);
-    mkdirSync(sibling);
-    expect(() => resolveLocalPath(dir, join(sibling, 'a.txt'), write)).toThrow(ProxmoxError);
-    expect(() => resolveLocalPath(dir, join(parent.toUpperCase(), 'a.txt'), write)).toThrow(ProxmoxError);
-  });
-
-  it('takes forward slashes for separators', () => {
-    const dir = realpathSync(tempDir());
-    mkdirSync(join(dir, 'a'));
-    expect(resolveLocalPath(dir, 'a/b.txt', write)).toBe(join(dir, 'a', 'b.txt'));
-    expect(() => resolveLocalPath(dir, 'a/../../b.txt', write)).toThrow(ProxmoxError);
-  });
-
-  it.each(['CON', 'con.txt', 'NUL', 'nul.tar.gz', 'COM1', 'LPT9.log', 'PRN', 'AUX', 'a\\NUL', 'CONIN$', 'CONOUT$', 'COM¹'])('refuses the device name %s', (name) => {
-    expect(() => resolveLocalPath(tempDir(), name, write), name).toThrow(ProxmoxError);
-  });
-
-  it.each(['a.txt:hidden', 'a.txt::$DATA', 'a.txt.', 'a.txt ', 'dir.\\a.txt', 'dir \\a.txt'])('refuses %j, which Windows would not take literally', (name) => {
-    expect(() => resolveLocalPath(tempDir(), name, write), name).toThrow(ProxmoxError);
-  });
-
-  it('does not refuse names that only look like those', () => {
-    const dir = realpathSync(tempDir());
-    for (const name of ['console.txt', 'nullable', 'com10', 'a.b.c', 'with space.txt', 'é.txt', 'conin']) {
-      expect(resolveLocalPath(dir, name, write), name).toBe(join(dir, name));
-    }
-  });
-});
-
-describe('the function itself', () => {
-  afterEach(closeSsh);
-
-  it('refuses without a directory, on an empty path, on NUL, and the directory itself', () => {
-    const dir = tempDir();
-    expect(() => resolveLocalPath(undefined, 'a', write)).toThrow(/off on this server/);
-    expect(() => resolveLocalPath(dir, '', write)).toThrow(ProxmoxError);
-    expect(() => resolveLocalPath(dir, 'a\0b', write)).toThrow(ProxmoxError);
-    expect(() => resolveLocalPath(dir, '.', write)).toThrow(ProxmoxError);
-    expect(() => resolveLocalPath(dir, dir, write)).toThrow(ProxmoxError);
-  });
-
-  it('refuses a directory setting that does not exist', () => {
-    expect(() => resolveLocalPath(join(tempDir(), 'gone'), 'a', write)).toThrow(/cannot be read/);
-  });
-});
+// The unit tests of the function itself, Windows paths included, are in src/proxmox/localpath.rs.

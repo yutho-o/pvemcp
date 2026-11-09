@@ -1,12 +1,56 @@
+import { spawn } from 'node:child_process';
 import http from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { createServer, type AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, describe, expect, it } from 'vitest';
-import { loadConfig } from '../src/config.js';
-import { startHttp, type HttpOptions } from '../src/http.js';
-import { Runtime } from '../src/runtime.js';
 import { FAKE_TOKEN, FakePve } from './fake-pve.js';
+import { binary } from './harness.js';
+
+interface HttpOptions {
+  host: string;
+  token: string;
+  allowedHosts: string[];
+}
+
+/** A port nobody listens on, for the binary to take. */
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address() as AddressInfo;
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+/** Runs pvemcp --http. Resolves once it listens, or with its exit code and stderr if it stops first. */
+function startBinary(options: Partial<HttpOptions>, port: number, env: Record<string, string>): Promise<{ stop: () => Promise<void>; exitCode?: number; stderr: string }> {
+  const child = spawn(binary(), ['--http', '--host', options.host ?? '127.0.0.1', '--port', String(port)], {
+    env: {
+      ...getDefaultEnvironment(),
+      ...env,
+      ...(options.token ? { PROXMOX_MCP_TOKEN: options.token } : {}),
+      ...(options.allowedHosts ? { PROXMOX_MCP_ALLOWED_HOSTS: options.allowedHosts.join(',') } : {}),
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  const exited = new Promise<number>((resolve) => child.once('exit', (code) => resolve(code ?? -1)));
+  const stop = async () => {
+    if (child.exitCode === null) child.kill();
+    await exited;
+  };
+  return new Promise((resolve) => {
+    let stderr = '';
+    child.stderr!.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+      if (stderr.includes('listening on')) resolve({ stop, stderr });
+    });
+    void exited.then((exitCode) => resolve({ stop, exitCode, stderr }));
+  });
+}
 
 const cleanups: Array<() => Promise<unknown> | unknown> = [];
 
@@ -17,17 +61,11 @@ afterEach(async () => {
 async function serve(options: Partial<HttpOptions> = {}, env: Record<string, string> = {}) {
   const fake = new FakePve();
   await fake.start();
-  const runtime = new Runtime(loadConfig({ PROXMOX_URL: fake.url, PROXMOX_TOKEN: FAKE_TOKEN, ...env }));
-  const server = await startHttp(runtime, { host: '127.0.0.1', port: 0, ...options });
-  cleanups.push(
-    () => new Promise<void>((resolve) => {
-      server.closeAllConnections();
-      server.close(() => resolve());
-    }),
-    () => runtime.shutdown(),
-    () => fake.stop(),
-  );
-  return { port: (server.address() as AddressInfo).port, runtime, fake };
+  const port = await freePort();
+  const server = await startBinary(options, port, { PROXMOX_URL: fake.url, PROXMOX_TOKEN: FAKE_TOKEN, ...env });
+  cleanups.push(server.stop, () => fake.stop());
+  if (server.exitCode !== undefined) throw new Error(`pvemcp --http stopped: ${server.stderr}`);
+  return { port, fake };
 }
 
 function request(port: number, opts: { method?: string; path?: string; headers?: Record<string, string>; body?: unknown } = {}): Promise<{ status: number; body: any }> {
@@ -99,9 +137,10 @@ describe('HTTP transport', () => {
   });
 
   it('refuses to listen on the network without a token', async () => {
-    const runtime = new Runtime(loadConfig({ PROXMOX_URL: 'https://192.0.2.1', PROXMOX_TOKEN: FAKE_TOKEN }));
-    cleanups.push(() => runtime.shutdown());
-    expect(() => startHttp(runtime, { host: '0.0.0.0', port: 0 })).toThrow(/without a token/);
+    const server = await startBinary({ host: '0.0.0.0' }, await freePort(), { PROXMOX_URL: 'https://192.0.2.1', PROXMOX_TOKEN: FAKE_TOKEN });
+    cleanups.push(server.stop);
+    expect(server.exitCode).toBe(1);
+    expect(server.stderr).toMatch(/without a token/);
   });
 
   it('requires the token when there is one', async () => {
