@@ -1,16 +1,15 @@
 import { createServer, type Server as NetServer, type AddressInfo } from 'node:net';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { loadConfig } from '../src/config.js';
-import { ProxmoxError } from '../src/proxmox/errors.js';
-import { NodeResolver } from '../src/proxmox/nodes.js';
-import { createSshTransport, type SshTransport } from '../src/ssh/index.js';
-import { PooledSshTransport, type TransportOptions } from '../src/ssh/transport.js';
-import { FAKE_SSH_PASSWORD, FakeSsh, generateKey } from './fake-ssh.js';
-import { closeSsh, connectSsh, tempDir } from './ssh-harness.js';
+import { FAKE_SSH_PASSWORD, FakeSsh, generateKey, ShellSandbox } from './fake-ssh.js';
+import { closeSsh, connectSsh, POSIX_SHELL, tempDir, type SshHarness } from './ssh-harness.js';
 
-/** The real transport against a real SSH server: every way a connection or a command can go. */
+/**
+ * The real transport of the binary against a real SSH server, driven through the SSH tools: every
+ * way a connection or a command can go. Timings the operator cannot set (idle time, channels at a
+ * time, connect timeout, grace before closing a timed out channel) come from PVEMCP_TEST_SSH_TRANSPORT.
+ */
 
 afterEach(closeSsh);
 
@@ -19,6 +18,13 @@ afterEach(async () => {
   for (const stop of started.splice(0)) await stop().catch(() => undefined);
 });
 
+interface Tuning {
+  idleMs?: number;
+  maxChannels?: number;
+  connectTimeoutMs?: number;
+  killGraceMs?: number;
+}
+
 async function start(options: ConstructorParameters<typeof FakeSsh>[0] = {}): Promise<FakeSsh> {
   const ssh = new FakeSsh(options);
   await ssh.start();
@@ -26,54 +32,37 @@ async function start(options: ConstructorParameters<typeof FakeSsh>[0] = {}): Pr
   return ssh;
 }
 
-function transportTo(ssh: { port: number; knownHostsLine?: () => string }, env: Record<string, string> = {}, options: TransportOptions = {}): PooledSshTransport {
-  const dir = tempDir();
-  const file = join(dir, 'known_hosts');
-  writeFileSync(file, ssh.knownHostsLine ? `${ssh.knownHostsLine()}\n` : '');
-  const config = loadConfig({
-    PROXMOX_URL: 'https://192.0.2.1',
-    PROXMOX_TOKEN: 'a@pve!t=s',
-    PROXMOX_ALLOW_SSH: 'true',
-    PROXMOX_SSH_PASSWORD: FAKE_SSH_PASSWORD,
-    PROXMOX_SSH_PORT: String(ssh.port),
-    PROXMOX_SSH_NODES: 'pve1=127.0.0.1',
-    PROXMOX_SSH_KNOWN_HOSTS: file,
-    PROXMOX_SSH_HOST_KEY_POLICY: ssh.knownHostsLine ? 'strict' : 'off',
-    ...env,
-  });
-  const instance = config.instances.get('default')!;
-  const nodes = new NodeResolver({ get: async () => [] }, { apiHost: '192.0.2.1', sshNodes: instance.ssh.nodes });
-  const transport = new PooledSshTransport(instance, nodes, options);
-  started.push(() => transport.close() as Promise<void>);
-  return transport;
+/** The binary, with SSH to this server for node pve1. A known host, checked strictly. */
+function serverFor(ssh: FakeSsh, env: Record<string, string> = {}, tuning?: Tuning): Promise<SshHarness> {
+  return connectSsh({ server: ssh, env: { ...env, ...(tuning ? { PVEMCP_TEST_SSH_TRANSPORT: JSON.stringify(tuning) } : {}) } });
 }
 
-const run = (transport: SshTransport, text: string, stdin?: string) => transport.exec({ node: 'pve1' }, { text, access: 'read', ...(stdin !== undefined ? { stdin } : {}) });
-
-async function errorOf(promise: Promise<unknown>): Promise<ProxmoxError> {
-  const err = await promise.then(() => new Error('expected a failure'), (e: unknown) => e);
-  if (err instanceof ProxmoxError) return err;
-  throw err;
+/** The binary, with SSH to a port that is no SSH server: there is no host key to know. */
+function serverForPort(port: number, tuning?: Tuning): Promise<SshHarness> {
+  return connectSsh({
+    server: { port } as unknown as FakeSsh,
+    unknownHost: true,
+    env: { PROXMOX_SSH_HOST_KEY_POLICY: 'off', ...(tuning ? { PVEMCP_TEST_SSH_TRANSPORT: JSON.stringify(tuning) } : {}) },
+  });
 }
 
-describe('ssh2 itself', () => {
-  it('loads on this platform and node, with optional native modules neither required nor missed', async () => {
-    const ssh2 = await import('ssh2');
-    const module = (ssh2 as unknown as { default: { Client: unknown; Server: unknown } }).default;
-    expect(module.Client).toBeTypeOf('function');
-    expect(module.Server).toBeTypeOf('function');
-  });
+const exec = (h: SshHarness, command: string, extra: Record<string, unknown> = {}) => h.call('pve_ssh_exec', { node: 'pve1', command, ...extra });
 
-  it('completes a real handshake with the default transport', async () => {
+async function listen(server: NetServer): Promise<number> {
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  started.push(async () => {
+    server.close();
+  });
+  return (server.address() as AddressInfo).port;
+}
+
+describe('the default transport', () => {
+  it('completes a real handshake against a strictly checked known host', async () => {
     const ssh = await start();
     ssh.on('echo hi', { stdout: 'hi\n' });
-    const file = join(tempDir(), 'known_hosts');
-    writeFileSync(file, `${ssh.knownHostsLine()}\n`);
-    const config = loadConfig({ PROXMOX_URL: 'https://192.0.2.1', PROXMOX_TOKEN: 'a@pve!t=s', PROXMOX_ALLOW_SSH: 'true', PROXMOX_SSH_PASSWORD: FAKE_SSH_PASSWORD, PROXMOX_SSH_PORT: String(ssh.port), PROXMOX_SSH_NODES: 'pve1=127.0.0.1', PROXMOX_SSH_KNOWN_HOSTS: file });
-    const instance = config.instances.get('default')!;
-    const transport = createSshTransport(instance, new NodeResolver({ get: async () => [] }, { apiHost: '192.0.2.1', sshNodes: instance.ssh.nodes }));
-    started.push(async () => transport.close());
-    expect(await run(transport, 'echo hi')).toMatchObject({ stdout: 'hi\n', exit_code: 0, timed_out: false, truncated: false });
+    const res = await exec(await serverFor(ssh), 'echo hi');
+    expect(res.isError).toBe(false);
+    expect(res.data).toMatchObject({ stdout: 'hi\n', exit_code: 0, timed_out: false, truncated: false });
   });
 });
 
@@ -83,77 +72,65 @@ describe('connection failures, each with its own type', () => {
     await new Promise<void>((resolve) => closed.listen(0, '127.0.0.1', resolve));
     const { port } = closed.address() as AddressInfo;
     await new Promise((resolve) => closed.close(resolve));
-    const err = await errorOf(run(transportTo({ port }), 'id'));
-    expect(err.type).toBe('ssh_unreachable');
-    expect(err.message).toContain('ECONNREFUSED');
-    expect(err.hint).toContain('PROXMOX_SSH_NODES');
+    const res = await exec(await serverForPort(port), 'id');
+    expect(res.data.error_type).toBe('ssh_unreachable');
+    expect(res.data.error).toContain('ECONNREFUSED');
+    expect(res.data.hint).toContain('PROXMOX_SSH_NODES');
   });
 
   it('ssh_timeout when a host accepts and then says nothing', async () => {
-    const silent: NetServer = createServer(() => undefined);
-    await new Promise<void>((resolve) => silent.listen(0, '127.0.0.1', resolve));
-    started.push(async () => {
-      silent.close();
-    });
-    const { port } = silent.address() as AddressInfo;
-    const started_at = Date.now();
-    const err = await errorOf(run(transportTo({ port }, {}, { connectTimeoutMs: 300 }), 'id'));
-    expect(err.type).toBe('ssh_timeout');
-    expect(Date.now() - started_at).toBeLessThan(5000);
+    const port = await listen(createServer(() => undefined));
+    const h = await serverForPort(port, { connectTimeoutMs: 300 });
+    const startedAt = Date.now();
+    const res = await exec(h, 'id');
+    expect(res.data.error_type).toBe('ssh_timeout');
+    expect(Date.now() - startedAt).toBeLessThan(5000);
   });
 
   it('ssh_unreachable when a host drops the connection during the handshake', async () => {
-    const dropper = createServer((socket) => socket.destroy());
-    await new Promise<void>((resolve) => dropper.listen(0, '127.0.0.1', resolve));
-    started.push(async () => {
-      dropper.close();
-    });
-    const err = await errorOf(run(transportTo({ port: (dropper.address() as AddressInfo).port }), 'id'));
-    expect(err.type).toBe('ssh_unreachable');
+    const port = await listen(createServer((socket) => socket.destroy()));
+    expect((await exec(await serverForPort(port), 'id')).data.error_type).toBe('ssh_unreachable');
   });
 
   it('ssh_auth_failed on a wrong password, and no retry in a loop', async () => {
     const ssh = await start();
-    const err = await errorOf(run(transportTo(ssh, { PROXMOX_SSH_PASSWORD: 'wrong-password' }), 'id'));
-    expect(err.type).toBe('ssh_auth_failed');
-    expect(err.message).not.toContain('wrong-password');
-    expect(err.hint).toContain('Do not retry');
+    const res = await exec(await serverFor(ssh, { PROXMOX_SSH_PASSWORD: 'wrong-password' }), 'id');
+    expect(res.data.error_type).toBe('ssh_auth_failed');
+    expect(res.text).not.toContain('wrong-password');
+    expect(res.data.hint).toContain('Do not retry');
     expect(ssh.commands).toEqual([]);
     expect(ssh.connections).toBe(1);
   });
 
   it('ssh_auth_failed on an unknown user', async () => {
     const ssh = await start();
-    expect((await errorOf(run(transportTo(ssh, { PROXMOX_SSH_USER: 'nobody' }), 'id'))).type).toBe('ssh_auth_failed');
+    expect((await exec(await serverFor(ssh, { PROXMOX_SSH_USER: 'nobody' }), 'id')).data.error_type).toBe('ssh_auth_failed');
   });
 
   it('ssh_auth_failed when a key needs a passphrase that was not given', async () => {
-    const passphrase = 'correct horse';
-    const key = generateKey('ed25519', { passphrase });
+    const key = generateKey('ed25519', { passphrase: 'correct horse' });
     const ssh = await start({ users: { root: { keys: [key.public] } } });
     const file = join(tempDir(), 'id_test');
     writeFileSync(file, key.private);
-    const err = await errorOf(run(transportTo(ssh, { PROXMOX_SSH_KEY_FILE: file, PROXMOX_SSH_PASSWORD: '' }), 'id'));
-    expect(err.type).toBe('ssh_auth_failed');
-    expect(err.hint).toContain('passphrase');
+    const res = await exec(await serverFor(ssh, { PROXMOX_SSH_KEY_FILE: file, PROXMOX_SSH_PASSWORD: '' }), 'id');
+    expect(res.data.error_type).toBe('ssh_auth_failed');
+    expect(res.data.hint).toContain('passphrase');
   });
 
   it('config_error when a key file goes missing after startup', async () => {
     const ssh = await start();
-    const dir = tempDir();
-    const file = join(dir, 'id_test');
+    const file = join(tempDir(), 'id_test');
     writeFileSync(file, generateKey().private);
-    const transport = transportTo(ssh, { PROXMOX_SSH_KEY_FILE: file });
-    const { rmSync } = await import('node:fs');
+    const h = await serverFor(ssh, { PROXMOX_SSH_KEY_FILE: file });
     rmSync(file);
-    expect((await errorOf(run(transport, 'id'))).type).toBe('config_error');
+    expect((await exec(h, 'id')).data.error_type).toBe('config_error');
   });
 
   it('ssh_unreachable when the host refuses channels: nothing was run', async () => {
     const ssh = await start({ refuseChannels: true });
-    const err = await errorOf(run(transportTo(ssh), 'id'));
-    expect(err.type).toBe('ssh_unreachable');
-    expect(err.hint).toContain('Nothing was run');
+    const res = await exec(await serverFor(ssh), 'id');
+    expect(res.data.error_type).toBe('ssh_unreachable');
+    expect(res.data.hint).toContain('Nothing was run');
   });
 });
 
@@ -161,25 +138,29 @@ describe('a host short of session slots', () => {
   it('waits and tries again, since nothing ran', async () => {
     const ssh = await start({ refuseFirstChannels: 3 });
     ssh.on('x', { stdout: 'y' });
-    expect((await run(transportTo(ssh), 'x')).stdout).toBe('y');
+    expect((await exec(await serverFor(ssh), 'x')).data.stdout).toBe('y');
     expect(ssh.commands).toHaveLength(1);
     expect(ssh.connections).toBe(1);
   });
 
   it('does the same for SFTP', async () => {
-    const ssh = await start({ refuseFirstChannels: 2, sftpRoot: tempDir() });
-    const sftp = await transportTo(ssh).sftp({ node: 'pve1' });
-    await sftp.writeFile('/f', 'x');
-    sftp.close();
+    const root = tempDir();
+    const ssh = await start({ refuseFirstChannels: 2, sftpRoot: root });
+    const h = await serverFor(ssh);
+    writeFileSync(join(h.localDir, 'f.txt'), 'x');
+    const res = await h.call('pve_ssh_upload', { node: 'pve1', local_path: 'f.txt', path: '/f' });
+    expect(res.isError).toBe(false);
+    expect(readFileSync(join(root, 'f'), 'utf8')).toBe('x');
   });
 
   it('gives up after a few seconds, saying nothing ran', async () => {
     const ssh = await start({ refuseChannels: true });
-    const started_at = Date.now();
-    const err = await errorOf(run(transportTo(ssh), 'x'));
-    expect(err.type).toBe('ssh_unreachable');
-    expect(err.message).toContain('refused');
-    expect(Date.now() - started_at).toBeLessThan(6000);
+    const h = await serverFor(ssh);
+    const startedAt = Date.now();
+    const res = await exec(h, 'x');
+    expect(res.data.error_type).toBe('ssh_unreachable');
+    expect(res.data.error).toContain('refused');
+    expect(Date.now() - startedAt).toBeLessThan(6000);
   });
 });
 
@@ -190,7 +171,7 @@ describe('authentication', () => {
     ssh.on('id', { stdout: 'root\n' });
     const file = join(tempDir(), 'id_test');
     writeFileSync(file, key.private);
-    expect((await run(transportTo(ssh, { PROXMOX_SSH_KEY_FILE: file, PROXMOX_SSH_PASSWORD: '' }), 'id')).stdout).toBe('root\n');
+    expect((await exec(await serverFor(ssh, { PROXMOX_SSH_KEY_FILE: file, PROXMOX_SSH_PASSWORD: '' }), 'id')).data.stdout).toBe('root\n');
     expect(ssh.authAttempts.at(-1)).toMatchObject({ method: 'publickey' });
   });
 
@@ -201,20 +182,21 @@ describe('authentication', () => {
     ssh.on('id', { stdout: 'root\n' });
     const file = join(tempDir(), 'id_test');
     writeFileSync(file, key.private);
-    expect((await run(transportTo(ssh, { PROXMOX_SSH_KEY_FILE: file, PROXMOX_SSH_KEY_PASSPHRASE: passphrase, PROXMOX_SSH_PASSWORD: '' }), 'id')).stdout).toBe('root\n');
+    const h = await serverFor(ssh, { PROXMOX_SSH_KEY_FILE: file, PROXMOX_SSH_KEY_PASSPHRASE: passphrase, PROXMOX_SSH_PASSWORD: '' });
+    expect((await exec(h, 'id')).data.stdout).toBe('root\n');
   });
 
   it('refuses another key', async () => {
     const ssh = await start({ users: { root: { keys: [generateKey().public] } } });
     const file = join(tempDir(), 'id_test');
     writeFileSync(file, generateKey().private);
-    expect((await errorOf(run(transportTo(ssh, { PROXMOX_SSH_KEY_FILE: file, PROXMOX_SSH_PASSWORD: '' }), 'id'))).type).toBe('ssh_auth_failed');
+    expect((await exec(await serverFor(ssh, { PROXMOX_SSH_KEY_FILE: file, PROXMOX_SSH_PASSWORD: '' }), 'id')).data.error_type).toBe('ssh_auth_failed');
   });
 
   it('answers a keyboard-interactive prompt with the password, as PAM setups require', async () => {
     const ssh = await start({ users: { root: { password: FAKE_SSH_PASSWORD, keyboardOnly: true } } });
     ssh.on('id', { stdout: 'root\n' });
-    expect((await run(transportTo(ssh), 'id')).stdout).toBe('root\n');
+    expect((await exec(await serverFor(ssh), 'id')).data.stdout).toBe('root\n');
     expect(ssh.authAttempts.at(-1)).toMatchObject({ method: 'keyboard-interactive', password: FAKE_SSH_PASSWORD });
   });
 });
@@ -223,90 +205,97 @@ describe('commands', () => {
   it('reports stdout, stderr, the exit code and the duration', async () => {
     const ssh = await start();
     ssh.on('x', { stdout: 'out', stderr: 'err', code: 3 });
-    const res = await run(transportTo(ssh), 'x');
-    expect(res).toMatchObject({ stdout: 'out', stderr: 'err', exit_code: 3, truncated: false, timed_out: false });
-    expect(res.duration_ms).toBeGreaterThanOrEqual(0);
-    expect(res.host_key).toEqual({ type: 'ssh-ed25519', fingerprint: ssh.hostKey.fingerprint });
+    const res = await exec(await serverFor(ssh), 'x');
+    expect(res.isError).toBe(false);
+    expect(res.data).toMatchObject({ stdout: 'out', stderr: 'err', exit_code: 3, truncated: false, timed_out: false });
+    expect(res.data.duration_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it('reports the host key it verified', async () => {
+    const ssh = await start();
+    ssh.on('hostname; id -un; pveversion 2>&1', { stdout: 'pve1\nroot\npve-manager/9.1.0\n' });
+    const res = await (await serverFor(ssh)).call('pve_ssh_test', { node: 'pve1' });
+    expect(res.data.host_key).toEqual({ type: 'ssh-ed25519', fingerprint: ssh.hostKey.fingerprint });
   });
 
   it('reports a command killed by a signal', async () => {
     const ssh = await start();
     ssh.on('x', { signal: 'KILL' });
-    expect(await run(transportTo(ssh), 'x')).toMatchObject({ exit_code: null, signal: 'SIGKILL' });
+    expect((await exec(await serverFor(ssh), 'x')).data).toMatchObject({ exit_code: null, signal: 'SIGKILL' });
   });
 
   it('gives stdin to the command, and always ends it', async () => {
     const ssh = await start();
     ssh.on('cat', (req) => ({ stdout: req.stdin }));
-    const transport = transportTo(ssh);
-    expect((await run(transport, 'cat', 'piped')).stdout).toBe('piped');
+    const h = await serverFor(ssh);
+    expect((await exec(h, 'cat', { stdin: 'piped' })).data.stdout).toBe('piped');
     // Without stdin, a command reading it must see the end at once, not hang until the timeout.
-    expect((await run(transport, 'cat')).stdout).toBe('');
+    expect((await exec(h, 'cat')).data.stdout).toBe('');
   });
 
   it('carries binary stdin as it is', async () => {
     const ssh = await start();
     let got: Buffer = Buffer.alloc(0);
-    ssh.on('x', (req) => {
+    ssh.on(/./, (req) => {
       got = req.stdin;
-      return {};
+      return { stdout: `${req.stdin.length}\n` };
     });
     const data = Buffer.from([0, 1, 2, 255, 254, 10, 13]);
-    await transportTo(ssh).exec({ node: 'pve1' }, { text: 'x', access: 'write', stdin: data });
+    const res = await (await serverFor(ssh)).call('pve_ssh_write_file', { node: 'pve1', path: '/tmp/x', content: data.toString('base64'), encoding: 'base64' });
+    expect(res.isError).toBe(false);
     expect(got.equals(data)).toBe(true);
   });
 
   it('handles output in UTF-8 cut across chunks', async () => {
     const ssh = await start();
     ssh.on('x', { stdout: Buffer.from('☃'.repeat(50_000)) });
-    expect((await run(transportTo(ssh), 'x')).stdout).toBe('☃'.repeat(50_000));
+    expect((await exec(await serverFor(ssh), 'x')).data.stdout).toBe('☃'.repeat(50_000));
   });
 
   it('wraps in sudo when told to, as one quoted argument', async () => {
     const ssh = await start({ users: { admin: { password: FAKE_SSH_PASSWORD } } });
     ssh.on(/^sudo /, { stdout: 'ok' });
-    await run(transportTo(ssh, { PROXMOX_SSH_USER: 'admin', PROXMOX_SSH_SUDO: 'true' }), `pct exec '100' -- sh -c 'it'\\''s'`);
+    await exec(await serverFor(ssh, { PROXMOX_SSH_USER: 'admin', PROXMOX_SSH_SUDO: 'true' }), `pct exec '100' -- sh -c 'it'\\''s'`);
     expect(ssh.commands[0]!.command).toBe(`sudo -n sh -c 'pct exec '\\''100'\\'' -- sh -c '\\''it'\\''\\'\\'''\\''s'\\'''`);
   });
 
   it('does not use sudo as root, however it is configured', async () => {
     const ssh = await start();
     ssh.on('id', { stdout: 'ok' });
-    await run(transportTo(ssh, { PROXMOX_SSH_SUDO: 'true' }), 'id');
+    await exec(await serverFor(ssh, { PROXMOX_SSH_SUDO: 'true' }), 'id');
     expect(ssh.commands[0]!.command).toBe('id');
   });
 });
 
 describe('timeouts', () => {
-  it('signals, then destroys the channel, and reports it', async () => {
+  it('signals, then destroys the channel, and reports it with the partial output', async () => {
     const ssh = await start();
     ssh.on('hang', { stdout: 'partial', hang: true });
-    const transport = transportTo(ssh, {}, { killGraceMs: 50 });
-    const res = await transport.exec({ node: 'pve1' }, { text: 'hang', access: 'read' }, { timeoutMs: 150 });
-    expect(res).toMatchObject({ timed_out: true, stdout: 'partial', exit_code: null });
+    const res = await exec(await serverFor(ssh, {}, { killGraceMs: 50 }), 'hang', { timeout_seconds: 1 });
+    expect(res.isError).toBe(true);
+    expect(res.data.error_type).toBe('ssh_timeout');
+    expect(res.data.details).toMatchObject({ stdout: 'partial', exit_code: null });
+    expect(res.data.hint).toContain('may still be running');
     expect(ssh.signals).toEqual(['TERM']);
     await vi.waitFor(() => expect(ssh.channelsClosed).toContain('hang'));
-  });
+  }, 15_000);
 
   it('leaves the connection usable afterwards', async () => {
     const ssh = await start();
     ssh.on('hang', { hang: true });
     ssh.on('id', { stdout: 'root' });
-    const transport = transportTo(ssh, {}, { killGraceMs: 50 });
-    await transport.exec({ node: 'pve1' }, { text: 'hang', access: 'read' }, { timeoutMs: 100 });
-    expect((await run(transport, 'id')).stdout).toBe('root');
+    const h = await serverFor(ssh, {}, { killGraceMs: 50 });
+    await exec(h, 'hang', { timeout_seconds: 1 });
+    expect((await exec(h, 'id')).data.stdout).toBe('root');
     expect(ssh.connections).toBe(1);
-  });
+  }, 15_000);
 
-  it('is a typed error from a tool, with the partial output', async () => {
+  it('applies PROXMOX_SSH_TIMEOUT_SECONDS by default', async () => {
     const ssh = await start();
     ssh.on('hang', { stdout: 'partial', hang: true });
-    const { call } = await connectSsh({ server: ssh, env: { PROXMOX_SSH_TIMEOUT_SECONDS: '1' } });
-    const res = await call('pve_ssh_exec', { node: 'pve1', command: 'hang', timeout_seconds: 1 });
-    expect(res.isError).toBe(true);
+    const res = await exec(await serverFor(ssh, { PROXMOX_SSH_TIMEOUT_SECONDS: '1' }), 'hang');
     expect(res.data.error_type).toBe('ssh_timeout');
     expect(res.data.details.stdout).toBe('partial');
-    expect(res.data.hint).toContain('may still be running');
   }, 15_000);
 });
 
@@ -314,53 +303,45 @@ describe('output cap', () => {
   it('keeps the start, says so, and lets the command finish', async () => {
     const ssh = await start();
     ssh.on('big', { flood: 3 * 1024 * 1024, code: 0 });
-    const res = await transportTo(ssh).exec({ node: 'pve1' }, { text: 'big', access: 'read' }, { maxBytes: 1024 });
-    expect(res.stdout).toHaveLength(1024);
-    expect(res).toMatchObject({ truncated: true, exit_code: 0, timed_out: false });
+    const res = await exec(await serverFor(ssh), 'big', { max_output_bytes: 1024 });
+    expect(res.data.stdout).toHaveLength(1024);
+    expect(res.data).toMatchObject({ truncated: true, exit_code: 0, timed_out: false, untrusted: true });
+    expect(res.data.warning).toContain('dropped');
     expect(ssh.signals).toEqual([]);
   });
 
-  it('applies PROXMOX_SSH_MAX_OUTPUT_BYTES by default', async () => {
+  it('applies PROXMOX_SSH_MAX_OUTPUT_BYTES by default, and as the upper limit', async () => {
     const ssh = await start();
     ssh.on('big', { flood: 200 * 1024 });
-    const res = await run(transportTo(ssh, { PROXMOX_SSH_MAX_OUTPUT_BYTES: '4096' }), 'big');
-    expect(res.stdout).toHaveLength(4096);
-    expect(res.truncated).toBe(true);
+    const h = await serverFor(ssh, { PROXMOX_SSH_MAX_OUTPUT_BYTES: '4096' });
+    const res = await exec(h, 'big');
+    expect(res.data.stdout).toHaveLength(4096);
+    expect(res.data.truncated).toBe(true);
+    expect((await exec(h, 'big', { max_output_bytes: 100_000 })).data.stdout).toHaveLength(4096);
   });
 
   it('caps stderr as well', async () => {
     const ssh = await start();
     ssh.on('big', { stderr: 'e'.repeat(100_000) });
-    const res = await transportTo(ssh).exec({ node: 'pve1' }, { text: 'big', access: 'read' }, { maxBytes: 2048 });
-    expect(res.stderr).toHaveLength(2048);
-    expect(res.truncated).toBe(true);
+    const res = await exec(await serverFor(ssh), 'big', { max_output_bytes: 2048 });
+    expect(res.data.stderr).toHaveLength(2048);
+    expect(res.data.truncated).toBe(true);
   });
 
   it('stops a command that never ends and only prints', async () => {
     const ssh = await start();
     ssh.on('yes', { flood: 200 * 1024 * 1024, hang: true });
-    const res = await transportTo(ssh, {}, { killGraceMs: 50 }).exec({ node: 'pve1' }, { text: 'yes', access: 'read' }, { maxBytes: 1024, timeoutMs: 60_000 });
-    expect(res.truncated).toBe(true);
-    expect(res.stdout).toHaveLength(1024);
+    const res = await exec(await serverFor(ssh, {}, { killGraceMs: 50 }), 'yes', { max_output_bytes: 1024, timeout_seconds: 60 });
+    expect(res.data.truncated).toBe(true);
+    expect(res.data.stdout).toHaveLength(1024);
     expect(ssh.signals).toEqual(['TERM']);
   }, 60_000);
-
-  it('is flagged by the tools, for an arbitrary command', async () => {
-    const ssh = await start();
-    ssh.on('big', { flood: 100_000 });
-    const { call } = await connectSsh({ server: ssh });
-    const res = await call('pve_ssh_exec', { node: 'pve1', command: 'big', max_output_bytes: 2048 });
-    expect(res.isError).toBe(false);
-    expect(res.data).toMatchObject({ truncated: true, exit_code: 0, untrusted: true });
-    expect(res.data.warning).toContain('dropped');
-    expect(res.data.stdout).toHaveLength(2048);
-  });
 });
 
 describe('the pool', () => {
   it('does not connect before the first command', async () => {
     const ssh = await start();
-    transportTo(ssh);
+    await serverFor(ssh);
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(ssh.connections).toBe(0);
   });
@@ -368,9 +349,9 @@ describe('the pool', () => {
   it('keeps one connection per node, whatever is asked at once', async () => {
     const ssh = await start();
     ssh.on('x', { stdout: 'y', delayMs: 10 });
-    const transport = transportTo(ssh);
-    await Promise.all(Array.from({ length: 12 }, () => run(transport, 'x')));
-    await run(transport, 'x');
+    const h = await serverFor(ssh);
+    await Promise.all(Array.from({ length: 12 }, () => exec(h, 'x')));
+    await exec(h, 'x');
     expect(ssh.connections).toBe(1);
     expect(ssh.commands).toHaveLength(13);
   });
@@ -378,8 +359,8 @@ describe('the pool', () => {
   it('limits channels at a time', async () => {
     const ssh = await start();
     ssh.on('x', { delayMs: 30 });
-    const transport = transportTo(ssh, {}, { maxChannels: 3 });
-    await Promise.all(Array.from({ length: 10 }, () => run(transport, 'x')));
+    const h = await serverFor(ssh, {}, { maxChannels: 3 });
+    await Promise.all(Array.from({ length: 10 }, () => exec(h, 'x')));
     expect(ssh.maxOpenChannels).toBeLessThanOrEqual(3);
     expect(ssh.commands).toHaveLength(10);
   });
@@ -387,32 +368,31 @@ describe('the pool', () => {
   it('closes when idle and opens again when needed', async () => {
     const ssh = await start();
     ssh.on('x', { stdout: 'y' });
-    const transport = transportTo(ssh, {}, { idleMs: 50 });
-    await run(transport, 'x');
+    const h = await serverFor(ssh, {}, { idleMs: 50 });
+    await exec(h, 'x');
     expect(ssh.connections).toBe(1);
     await vi.waitFor(async () => {
       await new Promise((resolve) => setTimeout(resolve, 80));
       expect((ssh as unknown as { clients: Set<unknown> }).clients.size).toBe(0);
     });
-    await run(transport, 'x');
+    await exec(h, 'x');
     expect(ssh.connections).toBe(2);
   });
 
   it('is not closed by the idle timer while a command runs', async () => {
     const ssh = await start();
     ssh.on('slow', { stdout: 'done', delayMs: 200 });
-    const res = await run(transportTo(ssh, {}, { idleMs: 30 }), 'slow');
-    expect(res.stdout).toBe('done');
+    expect((await exec(await serverFor(ssh, {}, { idleMs: 30 }), 'slow')).data.stdout).toBe('done');
   });
 
   it('reconnects after a lost connection', async () => {
     const ssh = await start();
     ssh.on('x', { stdout: 'y' });
-    const transport = transportTo(ssh);
-    await run(transport, 'x');
+    const h = await serverFor(ssh);
+    await exec(h, 'x');
     ssh.dropConnections();
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect((await run(transport, 'x')).stdout).toBe('y');
+    expect((await exec(h, 'x')).data.stdout).toBe('y');
     expect(ssh.connections).toBe(2);
   });
 
@@ -424,135 +404,88 @@ describe('the pool', () => {
       setTimeout(() => ssh.dropConnections(), 20);
       return { hang: true };
     });
-    const err = await errorOf(run(transportTo(ssh), 'x'));
-    expect(err.type).toBe('ssh_unreachable');
-    expect(err.hint).toContain('Check before running it again');
+    const res = await exec(await serverFor(ssh), 'x');
+    expect(res.data.error_type).toBe('ssh_unreachable');
+    expect(res.data.hint).toContain('Check before running it again');
     expect(runs).toBe(1);
   });
 
-  it('closes everything at shutdown, and refuses from then on', async () => {
+  it('closes everything when the server stops', async () => {
     const ssh = await start();
     ssh.on('x', { stdout: 'y' });
-    const transport = transportTo(ssh);
-    await run(transport, 'x');
-    await transport.close();
+    const h = await serverFor(ssh);
+    await exec(h, 'x');
+    // Closing stdin stops the server, which closes its connections on the way out.
+    await h.client.close();
     await vi.waitFor(() => expect((ssh as unknown as { clients: Set<unknown> }).clients.size).toBe(0));
-    expect((await errorOf(run(transport, 'x'))).type).toBe('ssh_unreachable');
   });
 
   it('does not keep a failed connection: the next call tries again', async () => {
     const ssh = await start();
-    const transport = transportTo(ssh, { PROXMOX_SSH_PASSWORD: 'wrong' });
-    await errorOf(run(transport, 'x'));
-    await errorOf(run(transport, 'x'));
+    const h = await serverFor(ssh, { PROXMOX_SSH_PASSWORD: 'wrong' });
+    await exec(h, 'x');
+    await exec(h, 'x');
     expect(ssh.connections).toBe(2);
   });
 });
 
 describe('SFTP', () => {
-  it('writes, reads, stats, lists, renames, changes mode and deletes, with real paths', async () => {
-    const dir = tempDir();
-    const ssh = await start({ sftpRoot: dir });
-    const sftp = await transportTo(ssh).sftp({ node: 'pve1' });
-    await sftp.writeFile('/a.txt', 'hello', { mode: 0o600 });
-    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('hello');
-    expect((await sftp.readFile('/a.txt')).toString()).toBe('hello');
-    expect(await sftp.stat('/a.txt')).toMatchObject({ size: 5, isFile: true, isDirectory: false });
-    expect((await sftp.readdir('/')).map((e) => e.name)).toEqual(['a.txt']);
-    await sftp.rename('/a.txt', '/b.txt');
-    await sftp.chmod('/b.txt', 0o644);
-    await sftp.unlink('/b.txt');
-    expect((await sftp.readdir('/')).map((e) => e.name)).toEqual([]);
-    sftp.close();
-  });
-
-  it('streams a file both ways, with the requested mode', async () => {
-    const dir = tempDir();
-    const local = tempDir();
-    const ssh = await start({ sftpRoot: dir });
-    const sftp = await transportTo(ssh).sftp({ node: 'pve1' });
-    const source = join(local, 'in.bin');
+  it('uploads a file with the requested mode', async () => {
+    const root = tempDir();
+    const ssh = await start({ sftpRoot: root });
+    const h = await serverFor(ssh);
     const content = Buffer.alloc(300_000, 'z');
-    writeFileSync(source, content);
-    await sftp.fastPut(source, '/up.bin', { mode: 0o600 });
-    expect(readFileSync(join(dir, 'up.bin')).equals(content)).toBe(true);
+    writeFileSync(join(h.localDir, 'in.bin'), content);
+    const res = await h.call('pve_ssh_upload', { node: 'pve1', local_path: 'in.bin', path: '/up.bin', mode: '0600' });
+    expect(res.isError).toBe(false);
+    expect(res.data.bytes).toBe(300_000);
+    expect(readFileSync(join(root, 'up.bin')).equals(content)).toBe(true);
     expect(ssh.sftpOps.filter((o) => o.op === 'open' || o.op === 'fsetstat').some((o) => o.mode !== undefined && (o.mode & 0o777) === 0o600)).toBe(true);
-    const back = join(local, 'out.bin');
-    await sftp.fastGet('/up.bin', back);
-    expect(readFileSync(back).equals(content)).toBe(true);
-    sftp.close();
   });
 
-  it('maps missing files to not_found', async () => {
-    const ssh = await start({ sftpRoot: tempDir() });
-    const sftp = await transportTo(ssh).sftp({ node: 'pve1' });
-    expect((await errorOf(sftp.readFile('/nope'))).type).toBe('not_found');
-    expect((await errorOf(sftp.stat('/nope'))).type).toBe('not_found');
-    sftp.close();
+  it.skipIf(!POSIX_SHELL)('streams a file back, whole', async () => {
+    const sandbox = new ShellSandbox(POSIX_SHELL!);
+    const ssh = await start({ sandbox });
+    started.push(async () => sandbox.remove());
+    const h = await serverFor(ssh);
+    const content = 'y'.repeat(300_000);
+    sandbox.write('/tmp/big.txt', content);
+    const res = await h.call('pve_ssh_download', { node: 'pve1', path: '/tmp/big.txt', local_path: 'out.txt' });
+    expect(res.isError).toBe(false);
+    expect(readFileSync(join(h.localDir, 'out.txt'), 'utf8')).toBe(content);
   });
 
   it('says when SFTP is off on the host', async () => {
     const ssh = await start();
-    const err = await errorOf(transportTo(ssh).sftp({ node: 'pve1' }));
-    expect(err.type).toBe('ssh_unreachable');
-    expect(err.message).toContain('SFTP');
-  });
-
-  it('refuses a closed session', async () => {
-    const ssh = await start({ sftpRoot: tempDir() });
-    const sftp = await transportTo(ssh).sftp({ node: 'pve1' });
-    sftp.close();
-    expect((await errorOf(sftp.readFile('/x'))).type).toBe('ssh_unreachable');
+    const h = await serverFor(ssh);
+    writeFileSync(join(h.localDir, 'f.txt'), 'x');
+    const res = await h.call('pve_ssh_upload', { node: 'pve1', local_path: 'f.txt', path: '/f' });
+    expect(res.data.error_type).toBe('ssh_unreachable');
+    expect(res.data.error).toContain('SFTP');
   });
 
   it('gives its channel back when closed', async () => {
     const ssh = await start({ sftpRoot: tempDir() });
     ssh.on('x', {});
-    const transport = transportTo(ssh, {}, { maxChannels: 1 });
-    const sftp = await transport.sftp({ node: 'pve1' });
-    sftp.close();
-    await run(transport, 'x');
+    const h = await serverFor(ssh, {}, { maxChannels: 1 });
+    writeFileSync(join(h.localDir, 'f.txt'), 'x');
+    expect((await h.call('pve_ssh_upload', { node: 'pve1', local_path: 'f.txt', path: '/f' })).isError).toBe(false);
+    expect((await exec(h, 'x')).isError).toBe(false);
     expect(ssh.commands).toHaveLength(1);
   });
 });
 
 describe('PTY', () => {
-  it('opens a login shell with the size asked for, on a connection of its own', async () => {
+  it('opens on a connection of its own', async () => {
     const ssh = await start();
     ssh.on('x', {});
-    const transport = transportTo(ssh);
-    await run(transport, 'x');
-    const channel = await transport.shell({ node: 'pve1' }, { cols: 90, rows: 30, term: 'vt100' });
+    const h = await serverFor(ssh);
+    await exec(h, 'x');
+    const res = await h.call('pve_ssh_session_open', { node: 'pve1', cols: 90, rows: 30, term: 'vt100' });
+    expect(res.isError).toBe(false);
     expect(ssh.ptys[0]).toMatchObject({ cols: 90, rows: 30, term: 'vt100' });
     expect(ssh.connections).toBe(2);
-    channel.close();
+    await h.call('pve_ssh_session_close', { session: res.data.session });
   });
-
-  it('runs a command under a PTY, and sudo wraps it', async () => {
-    const ssh = await start({ users: { admin: { password: FAKE_SSH_PASSWORD } } });
-    const transport = transportTo(ssh, { PROXMOX_SSH_USER: 'admin', PROXMOX_SSH_SUDO: 'true' });
-    const channel = await transport.shell({ node: 'pve1' }, { command: `pct enter '101'` });
-    expect(ssh.ptys[0]!.command).toBe(`sudo -n pct enter '101'`);
-    channel.close();
-  });
-
-  it('carries input and output, and reports the exit', async () => {
-    const ssh = await start();
-    const channel = await transportTo(ssh).shell({ node: 'pve1' });
-    const chunks: Buffer[] = [];
-    channel.onData((chunk) => chunks.push(chunk));
-    const closed = new Promise<{ code: number | null }>((resolve) => channel.onClose(resolve));
-    channel.write('uname\n');
-    await vi.waitFor(() => expect(Buffer.concat(chunks).toString()).toContain('ran: uname'));
-    channel.write('exit\n');
-    expect(await closed).toEqual({ code: 0 });
-  });
-
-  it('resizes', async () => {
-    const ssh = await start();
-    const channel = await transportTo(ssh).shell({ node: 'pve1' });
-    channel.resize?.(200, 50);
-    await vi.waitFor(() => expect(ssh.windowChanges).toEqual([{ cols: 200, rows: 50 }]));
-    channel.close();
-  });
+  // Commands under a PTY, sudo around them, input, output, exit and resize: test/ssh-tools.test.ts.
 });

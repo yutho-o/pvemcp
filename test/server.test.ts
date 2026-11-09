@@ -2,7 +2,6 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { renderResult } from '../src/server.js';
 import { FAKE_TOKEN, FakePve, pveError } from './fake-pve.js';
 import { ALL_GATES, closeAll, connect, WRITES } from './harness.js';
 
@@ -467,14 +466,6 @@ describe('paging and size limits', () => {
     const next = await call('pve_list_node_tasks', { page_offset: first.data.next_offset });
     expect(next.isError).toBe(false);
     expect(next.data.offset).toBe(first.data.next_offset);
-  });
-
-  it('cuts what has no rows into a preview that is still valid JSON', () => {
-    const text = renderResult({ blob: 'x'.repeat(5000) }, 2000);
-    const parsed = JSON.parse(text) as Record<string, unknown>;
-    expect(parsed.truncated).toBe(true);
-    expect(parsed.total_chars).toBeGreaterThan(5000);
-    expect(text.length).toBeLessThanOrEqual(2000);
   });
 });
 

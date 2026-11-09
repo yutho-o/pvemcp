@@ -1,0 +1,18 @@
+{
+ "version": {
+  "name": "pvemcp",
+  "version": "0.1.0"
+ },
+ "capabilities": {
+  "logging": {},
+  "prompts": {
+   "listChanged": true
+  },
+  "resources": {
+   "listChanged": true
+  },
+  "tools": {
+   "listChanged": true
+  }
+ }
+}

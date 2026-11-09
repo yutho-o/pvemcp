@@ -1,22 +1,13 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { loadConfig, type Env } from '../src/config.js';
-import { Runtime } from '../src/runtime.js';
-import { visibleTools } from '../src/server.js';
-import { DOMAINS, type ToolDef } from '../src/tools/helpers.js';
-import { ALL_GATES } from './harness.js';
+import { ALL_GATES, listTools, type Env } from './harness.js';
 
-/** What the README claims in numbers and names, against the code: it must not drift. */
+/** What the README claims in numbers and names, against the binary: it must not drift. */
 const ROOT = join(import.meta.dirname, '..');
 const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
-const BASE: Env = { PROXMOX_URL: 'https://pve:8006', PROXMOX_TOKEN: 'a@pam!b=c' };
 
-function list(env: Env) {
-  const runtime = new Runtime(loadConfig({ ...BASE, ...env }));
-  return visibleTools(runtime);
-}
+type Tool = ReturnType<typeof listTools>[number];
 
 /** The cells of the README table row that starts with this. */
 function row(first: string): string[] {
@@ -25,11 +16,18 @@ function row(first: string): string[] {
   return line.split('|').slice(2, -1).map((c) => c.trim());
 }
 
+function isReadOnlyDomainTool(t: Tool): boolean {
+  // The GET half of guest_exec counts with its gate in the README, as the gate table shows it.
+  return t.gate === 'read' || t.gate === 'sensitive' || t.gate === 'ssh_read';
+}
+
 describe('README', () => {
-  const all = list(ALL_GATES);
+  const all = listTools(ALL_GATES);
 
   it('gives the real number of tools per domain', () => {
-    for (const domain of DOMAINS) {
+    const domains = [...new Set(all.map((t) => t.domain))];
+    expect(domains.length).toBeGreaterThan(5);
+    for (const domain of domains) {
       const tools = all.filter((t) => t.domain === domain);
       const [read, write] = row(`\`${domain}\``);
       expect(Number(read), `${domain}: read`).toBe(tools.filter(isReadOnlyDomainTool).length);
@@ -45,7 +43,7 @@ describe('README', () => {
   });
 
   it('gives the real number of tools per configuration', () => {
-    const flags = { ...ALL_GATES } as Record<string, string | undefined>;
+    const flags: Env = { ...ALL_GATES };
     delete flags.PROXMOX_TOOLSETS;
     const ssh = { PROXMOX_ALLOW_SSH: 'true', PROXMOX_SSH_PASSWORD: 'x' };
     const cases: Array<[string, Env]> = [
@@ -57,13 +55,13 @@ describe('README', () => {
       ['`api,ssh`, toutes les options', { ...ALL_GATES, PROXMOX_TOOLSETS: 'api,ssh' }],
       ['`workflows,api`, lecture seule', { PROXMOX_TOOLSETS: 'workflows,api' }],
     ];
-    for (const [name, env] of cases) expect(Number(row(name)[0]), name).toBe(list(env).length);
+    for (const [name, env] of cases) expect(Number(row(name)[0]), name).toBe(listTools(env).length);
   });
 
   it('documents every variable the code reads', () => {
     const source = (dir: string): string =>
       readdirSync(dir, { withFileTypes: true })
-        .map((e) => (e.isDirectory() ? source(join(dir, e.name)) : e.name.endsWith('.ts') ? readFileSync(join(dir, e.name), 'utf8') : ''))
+        .map((e) => (e.isDirectory() ? source(join(dir, e.name)) : e.name.endsWith('.rs') ? readFileSync(join(dir, e.name), 'utf8') : ''))
         .join('\n');
     const names = new Set(source(join(ROOT, 'src')).match(/\bPROXMOX_[A-Z_]+\b/g));
     names.delete('PROXMOX_MASK'); // A constant: the mask Proxmox shows instead of a secret.
@@ -82,47 +80,14 @@ describe('README', () => {
   });
 });
 
-function isReadOnlyDomainTool(t: ToolDef): boolean {
-  // The GET half of guest_exec counts with its gate in the README, as the gate table shows it.
-  return t.gate === 'read' || t.gate === 'sensitive' || t.gate === 'ssh_read';
-}
-
+// examples/instances.json loading moved to src/config.rs (the_instances_example_loads_as_it_is).
 describe('examples', () => {
-  it('instances.json loads as it is, and every ${VARIABLE} is expanded, nested ones too', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'pvemcp-examples-'));
-    try {
-      const key = join(dir, 'key');
-      writeFileSync(key, 'unused');
-      const pin = `SHA256:${'A'.repeat(43)}`;
-      const config = loadConfig({
-        PROXMOX_CONFIG: join(ROOT, 'examples', 'instances.json'),
-        PVE_LAB_TOKEN: 'mcp@pve!pvemcp=secret',
-        PVE_LAB_FINGERPRINT: 'AA:'.repeat(31) + 'AA',
-        PVE_LAB_LOCAL_DIR: dir,
-        PVE_LAB_SSH_KEY_FILE: key,
-        PVE1_HOST_KEY: pin,
-        PVE_PROD_TOKEN_SECRET: 'secret',
-      });
-      expect([...config.instances.keys()]).toEqual(['lab', 'prod']);
-      expect(config.defaultInstance).toBe('lab');
-      const lab = config.instances.get('lab')!;
-      expect(lab.allowSsh).toBe(true);
-      expect(lab.ssh.fingerprints.pve1).toBe(pin);
-      expect(lab.ssh.nodes.pve2).toBe('10.0.0.12');
-      const prod = config.instances.get('prod')!;
-      expect(prod.allowWrites).toBe(false);
-      expect(prod.dryRun).toBe(true);
-      expect([...prod.protectedVmids]).toEqual([100, 101]);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('mcp.json is valid and starts the built server', () => {
-    const mcp = JSON.parse(readFileSync(join(ROOT, 'examples', 'mcp.json'), 'utf8')) as { mcpServers: Record<string, { command: string; args: string[]; env: Env }> };
-    expect(mcp.mcpServers.proxmox!.command).toBe('node');
-    expect(mcp.mcpServers.proxmox!.args[0]).toMatch(/dist\/index\.js$/);
-    expect(mcp.mcpServers.proxmox!.env.PROXMOX_URL).toBeTruthy();
+  it('mcp.json is valid and starts the built binary', () => {
+    const mcp = JSON.parse(readFileSync(join(ROOT, 'examples', 'mcp.json'), 'utf8')) as { mcpServers: Record<string, { command: string; args?: string[]; env: Env }> };
+    const proxmox = mcp.mcpServers.proxmox!;
+    expect(proxmox.command).toMatch(/pvemcp(?:\.exe)?$/);
+    expect(proxmox.command).not.toMatch(/\bnode\b/);
+    expect(proxmox.env.PROXMOX_URL).toBeTruthy();
     expect(JSON.stringify(mcp)).not.toMatch(/ALLOW_(?:WRITES|SSH|ELEVATED)/);
   });
 });

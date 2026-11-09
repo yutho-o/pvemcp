@@ -1,19 +1,68 @@
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
+import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { afterEach, describe, expect, it } from 'vitest';
-import { catalog, findEndpoint, templateParams, type CatalogEndpoint, type CatalogParam } from '../src/catalog/index.js';
-import { classify } from '../src/proxmox/policy.js';
-import { isReadOnlyTool, type ToolDef } from '../src/tools/helpers.js';
-import { allTools } from '../src/tools/index.js';
-import { endpointTools, EXCLUDED_ENDPOINTS, UPLOAD_ENDPOINT } from '../src/tools/endpoints.js';
-import { domainOf, OVERRIDES, toolName } from '../src/tools/naming.js';
-import { FAKE_PASSWORD, FAKE_USER } from './fake-pve.js';
-import { ALL_GATES, closeAll, connect } from './harness.js';
+import { catalog, findEndpoint, templateParams, type CatalogEndpoint, type CatalogParam } from './catalog.js';
+import { FAKE_PASSWORD, FAKE_TOKEN, FAKE_USER } from './fake-pve.js';
+import { ALL_GATES, closeAll, connect, listTools, spawnServer } from './harness.js';
 
 afterEach(closeAll);
 
-const keyOf = (e: CatalogEndpoint) => `${e.method} ${e.path}`;
+/** What cannot be a tool, and why: src/tools/endpoints.rs holds the same list. */
+const EXCLUDED_ENDPOINTS: Readonly<Record<string, string>> = {
+  'GET /nodes/{node}/vncwebsocket': 'Websocket console: a tool call cannot hold it.',
+  'GET /nodes/{node}/qemu/{vmid}/vncwebsocket': 'Websocket console: a tool call cannot hold it.',
+  'GET /nodes/{node}/lxc/{vmid}/vncwebsocket': 'Websocket console: a tool call cannot hold it.',
+  'GET /nodes/{node}/qemu/{vmid}/mtunnelwebsocket': 'Migration tunnel, internal to remote_migrate.',
+  'GET /nodes/{node}/lxc/{vmid}/mtunnelwebsocket': 'Migration tunnel, internal to remote_migrate.',
+  'POST /nodes/{node}/qemu/{vmid}/mtunnel': 'Migration tunnel, internal to remote_migrate.',
+  'POST /nodes/{node}/lxc/{vmid}/mtunnel': 'Migration tunnel, internal to remote_migrate.',
+  'POST /nodes/{node}/execute': 'Runs a batch of API calls, which would bypass the policy.',
+  'GET /access/ticket': 'Dummy endpoint for the login form: authentication is handled by the client.',
+  'POST /access/ticket': 'Authentication is handled by the client.',
+  'POST /access/openid/login': 'Interactive browser login.',
+  'POST /nodes/{node}/storage/{storage}/upload': 'Needs a multipart body: pve_upload_to_storage is the tool for it.',
+};
+const UPLOAD_ENDPOINT = 'POST /nodes/{node}/storage/{storage}/upload';
+
+/** One method of the API as pve_api_search describes it: the gate and tool the server gives it. */
+interface ApiRow {
+  method: string;
+  path: string;
+  gate: string;
+  destructive?: boolean;
+  domain: string;
+  tool: string | null;
+}
+
+/** What the binary says of every API method and every tool, with every gate open. Read once. */
+async function whatTheServerSays(): Promise<{ rows: ApiRow[]; tools: Tool[] }> {
+  const { client } = await spawnServer({ PROXMOX_URL: 'https://127.0.0.1:8006', PROXMOX_TOKEN: FAKE_TOKEN, ...ALL_GATES });
+  const rows: ApiRow[] = [];
+  // "pve" is in the name of every tool, so it is in every haystack.
+  for (let offset: number | undefined = 0; offset !== undefined; ) {
+    const res = (await client.callTool({ name: 'pve_api_search', arguments: { query: 'pve', page_limit: 200, page_offset: offset } })) as { content: Array<{ text: string }> };
+    const data = JSON.parse(res.content[0]!.text) as { rows: ApiRow[]; has_more: boolean; next_offset?: number };
+    rows.push(...data.rows);
+    offset = data.has_more ? data.next_offset : undefined;
+  }
+  const { tools } = await client.listTools();
+  await client.close();
+  return { rows, tools };
+}
+
+const announced = await whatTheServerSays();
+const keyOf = (e: { method: string; path: string }) => `${e.method} ${e.path}`;
+const rowOf = new Map(announced.rows.map((r) => [keyOf(r), r]));
+function toolName(method: string, path: string): string {
+  const tool = rowOf.get(`${method} ${path}`)?.tool;
+  if (!tool) throw new Error(`No tool for ${method} ${path}`);
+  return tool;
+}
 const generatedEndpoints = catalog.endpoints.filter((e) => !EXCLUDED_ENDPOINTS[keyOf(e)]);
-const byName = new Map<string, ToolDef>(endpointTools().map((t) => [t.name, t]));
+/** The tools made from the catalog: one per method, and the upload. */
+const generatedNames = new Set(announced.rows.flatMap((r) => (r.tool ? [r.tool] : [])));
+const listed = new Map(announced.tools.map((t) => [t.name, t]));
+const byList = new Map(listTools(ALL_GATES).map((t) => [t.name, t]));
 
 describe('the catalog', () => {
   it('holds every method of the schema', () => {
@@ -47,49 +96,44 @@ describe('coverage of the API', () => {
       expect(findEndpoint(method, path), key).toBeDefined();
       expect(EXCLUDED_ENDPOINTS[key]!.length, key).toBeGreaterThan(10);
     }
+    expect(announced.rows).toHaveLength(680);
     expect(generatedEndpoints).toHaveLength(668);
-    for (const e of generatedEndpoints) expect(byName.has(toolName(e.method, e.path)), keyOf(e)).toBe(true);
-    expect(endpointTools()).toHaveLength(669);
+    for (const e of generatedEndpoints) expect(listed.has(toolName(e.method, e.path)), keyOf(e)).toBe(true);
+    // The server gives no tool to the excluded methods, other than the upload.
+    for (const key of Object.keys(EXCLUDED_ENDPOINTS)) expect(rowOf.get(key)!.tool, key).toBe(key === UPLOAD_ENDPOINT ? 'pve_upload_to_storage' : null);
+    expect(generatedNames.size).toBe(669);
   });
 
   it('leaves out only what the policy blocks, and the upload that has its own tool', () => {
-    for (const key of Object.keys(EXCLUDED_ENDPOINTS)) {
-      const [method, path] = key.split(' ') as [string, string];
-      const values = Object.fromEntries(templateParams(path).map((n) => [n, 'x']));
-      expect(classify(method, path, values).gate, key).toBe(key === UPLOAD_ENDPOINT ? 'write' : 'blocked');
-    }
-    expect(byName.has('pve_upload_to_storage')).toBe(true);
-    expect(generatedEndpoints.filter((e) => classify(e.method, e.path, Object.fromEntries(templateParams(e.path).map((n) => [n, 'x']))).gate === 'blocked').map(keyOf)).toEqual([]);
+    for (const key of Object.keys(EXCLUDED_ENDPOINTS)) expect(rowOf.get(key)!.gate, key).toBe(key === UPLOAD_ENDPOINT ? 'write' : 'blocked');
+    expect(listed.has('pve_upload_to_storage')).toBe(true);
+    expect(generatedEndpoints.filter((e) => rowOf.get(keyOf(e))!.gate === 'blocked').map(keyOf)).toEqual([]);
   });
 
   it('takes gate, destructiveness and read-only from the policy, for every tool', () => {
     for (const e of generatedEndpoints) {
-      const def = byName.get(toolName(e.method, e.path))!;
-      const decision = classify(e.method, e.path, Object.fromEntries(templateParams(e.path).map((n) => [n, 'x'])));
-      expect(decision.template, keyOf(e)).toBe(e.path);
-      expect(def.gate, keyOf(e)).toBe(decision.gate);
-      expect(def.destructive === true, keyOf(e)).toBe(decision.destructive);
-      expect(isReadOnlyTool(def), keyOf(e)).toBe(e.method === 'GET');
-      expect(def.description, keyOf(e)).toContain(keyOf(e));
-      expect(def.domain, keyOf(e)).toBe(domainOf(e.path).domain);
+      const row = rowOf.get(keyOf(e))!;
+      const name = toolName(e.method, e.path);
+      const tool = listed.get(name)!;
+      expect(byList.get(name)!.gate, keyOf(e)).toBe(row.gate);
+      expect(byList.get(name)!.domain, keyOf(e)).toBe(row.domain);
+      // "Destructive." is the fact of the policy; "Destructive with some argument values" is another one.
+      expect(/\bDestructive\.[\s\]]/.test(tool.description ?? ''), keyOf(e)).toBe(row.destructive === true);
+      if (row.destructive) expect(tool.annotations?.destructiveHint, keyOf(e)).toBe(true);
+      expect(tool.annotations?.readOnlyHint, keyOf(e)).toBe(e.method === 'GET');
+      expect(tool.description, keyOf(e)).toContain(keyOf(e));
     }
   });
 });
 
 describe('tool names', () => {
   it('are unique across all tools, and fit the format', () => {
-    const tools = allTools(() => ({}));
-    const names = tools.map((t) => t.name);
+    const names = listTools(ALL_GATES).map((t) => t.name);
     expect(new Set(names).size).toBe(names.length);
     for (const name of names) expect(name).toMatch(/^pve_[a-z0-9_]{1,60}$/);
   });
 
-  it('have no override for a method that does not exist', () => {
-    for (const key of Object.keys(OVERRIDES)) {
-      const [method, path] = key.split(' ') as [string, string];
-      expect(findEndpoint(method, path), key).toBeDefined();
-    }
-  });
+  // That no override names a method that does not exist is checked in src/tools/naming.rs.
 
   it('read as intended on the examples of the design, and on what the rules would name badly', () => {
     const expected: Array<[string, string, string]> = [
@@ -122,26 +166,31 @@ describe('tool names', () => {
 });
 
 describe('generated input', () => {
-  const props = (name: string) => byName.get(name)!.input as unknown as Record<string, { isOptional(): boolean; description?: string }>;
+  const schema = (name: string) => listed.get(name)!.inputSchema as { properties: Record<string, { description?: string }>; required?: string[] };
+  const props = (name: string) => schema(name).properties;
+  const optional = (name: string, arg: string) => {
+    expect(props(name), `${name} ${arg}`).toHaveProperty([arg]);
+    return !(schema(name).required ?? []).includes(arg);
+  };
 
   it('leaves node out only where the server can find it', () => {
-    expect(props('pve_start_vm').node!.isOptional()).toBe(true);
-    expect(props('pve_start_vm').vmid!.isOptional()).toBe(false);
-    expect(props('pve_list_vms').node!.isOptional()).toBe(true);
-    expect(props('pve_get_node_status').node!.isOptional()).toBe(true);
+    expect(optional('pve_start_vm', 'node')).toBe(true);
+    expect(optional('pve_start_vm', 'vmid')).toBe(false);
+    expect(optional('pve_list_vms', 'node')).toBe(true);
+    expect(optional('pve_get_node_status', 'node')).toBe(true);
     // Here it names the node to take out of the cluster: a default would be a disaster.
-    expect(props('pve_remove_cluster_node').node!.isOptional()).toBe(false);
-    expect(props('pve_add_cluster_node').node!.isOptional()).toBe(false);
+    expect(optional('pve_remove_cluster_node', 'node')).toBe(false);
+    expect(optional('pve_add_cluster_node', 'node')).toBe(false);
   });
 
   it('keeps placeholders the schema does not declare', () => {
-    expect(props('pve_update_ha_rule').rule!.isOptional()).toBe(false);
-    expect(props('pve_update_sdn_prefix_list_entry').url_seq!.isOptional()).toBe(false);
+    expect(optional('pve_update_ha_rule', 'rule')).toBe(false);
+    expect(optional('pve_update_sdn_prefix_list_entry', 'url_seq')).toBe(false);
   });
 
   it('names indexed params without the [n], and not over a plain one of the same name', () => {
     const vm = props('pve_create_vm');
-    expect(vm.net!.isOptional()).toBe(true);
+    expect(optional('pve_create_vm', 'net')).toBe(true);
     expect(vm['net[n]']).toBeUndefined();
     expect(vm.net!.description).toContain('{"0": "virtio,bridge=vmbr0"}');
     expect(vm.numa).toBeDefined();
@@ -163,9 +212,9 @@ describe('over a real MCP client', () => {
   it('lists every tool with a valid schema, and the hints of its policy', async () => {
     const { client } = await connect({ env: ALL_GATES });
     const { tools } = await client.listTools();
-    const listed = new Map(tools.map((t) => [t.name, t]));
-    expect(listed.size).toBe(tools.length);
-    for (const name of byName.keys()) expect(listed.has(name), name).toBe(true);
+    const shown = new Map(tools.map((t) => [t.name, t]));
+    expect(shown.size).toBe(tools.length);
+    for (const name of generatedNames) expect(shown.has(name), name).toBe(true);
 
     const ajv = new AjvJsonSchemaValidator();
     for (const t of tools) {
@@ -178,16 +227,15 @@ describe('over a real MCP client', () => {
     }
 
     for (const e of generatedEndpoints) {
-      const t = listed.get(toolName(e.method, e.path))!;
+      const t = shown.get(toolName(e.method, e.path))!;
       expect(t.annotations?.readOnlyHint, keyOf(e)).toBe(e.method === 'GET');
       expect('dry_run' in (t.inputSchema.properties ?? {}), keyOf(e)).toBe(e.method !== 'GET');
-      const decision = classify(e.method, e.path, Object.fromEntries(templateParams(e.path).map((n) => [n, 'x'])));
-      if (decision.destructive) expect(t.annotations?.destructiveHint, keyOf(e)).toBe(true);
+      if (rowOf.get(keyOf(e))!.destructive) expect(t.annotations?.destructiveHint, keyOf(e)).toBe(true);
     }
   });
 
   it('shows few tools by default: gates and toolsets hide the rest', async () => {
-    const generated = (names: string[]) => names.filter((n) => byName.has(n));
+    const generated = (names: string[]) => names.filter((n) => generatedNames.has(n));
     const readOnly = await connect();
     const names = await readOnly.toolNames();
     // Counts of generated tools only, so that curated tools can come and go.
@@ -250,7 +298,7 @@ describe('every method, end to end', () => {
       env: { ...ALL_GATES, PROXMOX_TOKEN: undefined, PROXMOX_USERNAME: FAKE_USER, PROXMOX_PASSWORD: FAKE_PASSWORD, PROXMOX_TASK_WAIT_SECONDS: '0' },
     });
     const failures: string[] = [];
-    for (const e of generatedEndpoints) {
+    for (const e of generatedEndpoints as CatalogEndpoint[]) {
       const args: Record<string, unknown> = {};
       for (const p of templateParams(e.path)) args[p] = valueFor(p, e.params[p], e.path);
       for (const [name, param] of Object.entries(e.params)) {

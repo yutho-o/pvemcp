@@ -2,21 +2,88 @@ import { readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { z } from 'zod';
-import { catalog, findEndpoint, templateParams, type HttpMethod } from '../src/catalog/index.js';
-import { endpointTools } from '../src/tools/endpoints.js';
-import { domainOf, toolName } from '../src/tools/naming.js';
-import { FAKE_PASSWORD, FAKE_USER } from './fake-pve.js';
-import { ALL_GATES, closeAll, connect, WRITES } from './harness.js';
+import type { Tool } from '@modelcontextprotocol/sdk/types.js';
+import { catalog, findEndpoint, templateParams, type CatalogParam, type HttpMethod } from './catalog.js';
+import { FAKE_PASSWORD, FAKE_TOKEN, FAKE_USER } from './fake-pve.js';
+import { ALL_GATES, closeAll, connect, spawnServer, WRITES, type Harness } from './harness.js';
 
 afterEach(closeAll);
 
-const byName = new Map(endpointTools().map((t) => [t.name, t]));
+/** What the binary says of every API method (its tool) and of every tool, with every gate open. Read once. */
+async function whatTheServerSays(): Promise<{ tools: Map<string, string>; listed: Map<string, Tool> }> {
+  const { client } = await spawnServer({ PROXMOX_URL: 'https://127.0.0.1:8006', PROXMOX_TOKEN: FAKE_TOKEN, ...ALL_GATES });
+  const tools = new Map<string, string>();
+  // "pve" is in the name of every tool, so it is in every haystack.
+  for (let offset: number | undefined = 0; offset !== undefined; ) {
+    const res = (await client.callTool({ name: 'pve_api_search', arguments: { query: 'pve', page_limit: 200, page_offset: offset } })) as { content: Array<{ text: string }> };
+    const data = JSON.parse(res.content[0]!.text) as { rows: Array<{ method: string; path: string; tool: string | null }>; has_more: boolean; next_offset?: number };
+    for (const r of data.rows) if (r.tool) tools.set(`${r.method} ${r.path}`, r.tool);
+    offset = data.has_more ? data.next_offset : undefined;
+  }
+  const listed = new Map((await client.listTools()).tools.map((t) => [t.name, t]));
+  await client.close();
+  return { tools, listed };
+}
 
-function def(method: HttpMethod, template: string) {
-  const found = byName.get(toolName(method, template));
-  if (!found) throw new Error(`No tool for ${method} ${template}`);
-  return found;
+const announced = await whatTheServerSays();
+/** The tools made from the catalog. */
+const generatedNames = new Set(announced.tools.values());
+
+function toolName(method: string, template: string): string {
+  const name = announced.tools.get(`${method} ${template}`);
+  if (!name) throw new Error(`No tool for ${method} ${template}`);
+  return name;
+}
+
+/** The tool of an endpoint, as a client is shown it. */
+function def(method: HttpMethod, template: string): Tool & { inputSchema: { properties: Record<string, any>; required?: string[] } } {
+  return announced.listed.get(toolName(method, template)) as any;
+}
+
+/** A value the schema accepts, from what the catalog says of the parameter. */
+function valueFor(name: string, param: CatalogParam | undefined, template: string): unknown {
+  if (param?.enum) return param.type === 'integer' ? Number(param.enum[0]) : param.enum[0];
+  if (name === 'node') return 'pve1';
+  if (name === 'vmid') return template.includes('/lxc') ? 101 : 100;
+  if (name === 'upid') return 'UPID:pve1:00000001:00000002:00000003:qmstart:100:root@pam:';
+  if (name === 'volume') return 'local:iso/debian.iso';
+  if (name === 'cidr') return '10.0.0.0/24';
+  if (!param) return 'x1';
+  switch (param.type) {
+    case 'boolean':
+      return true;
+    case 'integer':
+    case 'number':
+      return param.minimum ?? 1;
+    case 'array':
+      return ['x'];
+    default:
+      return 'x'.repeat(Math.max(param.minLength ?? 1, 2));
+  }
+}
+
+let checker: Promise<Harness> | undefined;
+afterEach(() => {
+  checker = undefined;
+});
+
+/**
+ * Whether the schema of the tool takes these arguments, as the server judges them before anything
+ * else. Writes are dry runs. With fill, the other required arguments get a value that passes.
+ */
+async function accepts(method: HttpMethod, template: string, args: Record<string, unknown>, fill = false): Promise<boolean> {
+  checker ??= connect({ fake: { permissive: true }, env: ALL_GATES });
+  const { call } = await checker;
+  const full: Record<string, unknown> = {};
+  if (fill) {
+    const e = findEndpoint(method, template)!;
+    for (const p of templateParams(template)) full[p] = valueFor(p, e.params[p], template);
+    for (const [name, param] of Object.entries(e.params)) if (!param.optional && !name.endsWith('[n]') && !(name in full)) full[name] = valueFor(name, param, template);
+  }
+  Object.assign(full, args);
+  if (method !== 'GET') full.dry_run = true;
+  const res = await call(toolName(method, template), full);
+  return !res.text.includes('Input validation error');
 }
 
 /** The schema an MCP client is shown for this tool. */
@@ -189,7 +256,7 @@ describe('what reaches Proxmox, under the exact name it expects', () => {
     expect(res.isError, res.text).toBe(false);
     expect(seen!.pathParams.rule).toBe('r1');
     expect(seen!.body).toEqual({ type: 'node-affinity', strict: '1', nodes: 'pve1:2,pve2' });
-    expect(def('POST', '/cluster/ha/rules').input).toHaveProperty('type');
+    expect(def('POST', '/cluster/ha/rules').inputSchema.properties).toHaveProperty('type');
   });
 
   it('prefix lists: a placeholder the schema does not declare, next to a parameter of a similar name', async () => {
@@ -246,15 +313,15 @@ describe('what reaches Proxmox, under the exact name it expects', () => {
 });
 
 describe('what an agent may send', () => {
-  const parse = (method: HttpMethod, template: string, args: Record<string, unknown>) => z.object(def(method, template).input).loose().safeParse(args);
+  const parse = (method: HttpMethod, template: string, args: Record<string, unknown>) => accepts(method, template, args);
   const SNAP = `${VM}/status/start`;
 
-  it.each([1, 0, '1', '0', true, false, 'true', 'false', 'on', 'off', 'yes', 'no', 'ON', 'False', ' 1 '])('takes %j for a boolean, as Proxmox does', (value) => {
-    expect(parse('POST', SNAP, { vmid: 100, skiplock: value }).success).toBe(true);
+  it.each([1, 0, '1', '0', true, false, 'true', 'false', 'on', 'off', 'yes', 'no', 'ON', 'False', ' 1 '])('takes %j for a boolean, as Proxmox does', async (value) => {
+    expect(await parse('POST', SNAP, { vmid: 100, skiplock: value })).toBe(true);
   });
 
-  it.each(['maybe', 2, -1, '', {}, []])('refuses %j for a boolean', (value) => {
-    expect(parse('POST', SNAP, { vmid: 100, skiplock: value }).success).toBe(false);
+  it.each(['maybe', 2, -1, '', {}, []])('refuses %j for a boolean', async (value) => {
+    expect(await parse('POST', SNAP, { vmid: 100, skiplock: value })).toBe(false);
   });
 
   it('turns them all into what goes on the wire', async () => {
@@ -272,18 +339,18 @@ describe('what an agent may send', () => {
     }
   });
 
-  it('takes digits in text for a number, inside the same limits', () => {
-    const vmid = (value: unknown) => parse('POST', SNAP, { vmid: value }).success;
-    expect(vmid(100)).toBe(true);
-    expect(vmid('100')).toBe(true);
-    expect(vmid(999999999)).toBe(true);
-    expect(vmid(99)).toBe(false);
-    expect(vmid('99')).toBe(false);
-    expect(vmid(1000000000)).toBe(false);
-    expect(vmid(100.5)).toBe(false);
-    expect(vmid('100.5')).toBe(false);
-    expect(vmid('abc')).toBe(false);
-    expect(vmid(undefined)).toBe(false);
+  it('takes digits in text for a number, inside the same limits', async () => {
+    const vmid = (value: unknown) => parse('POST', SNAP, value === undefined ? {} : { vmid: value });
+    expect(await vmid(100)).toBe(true);
+    expect(await vmid('100')).toBe(true);
+    expect(await vmid(999999999)).toBe(true);
+    expect(await vmid(99)).toBe(false);
+    expect(await vmid('99')).toBe(false);
+    expect(await vmid(1000000000)).toBe(false);
+    expect(await vmid(100.5)).toBe(false);
+    expect(await vmid('100.5')).toBe(false);
+    expect(await vmid('abc')).toBe(false);
+    expect(await vmid(undefined)).toBe(false);
   });
 
   it('reads a node from the vmid given as text', async () => {
@@ -298,20 +365,20 @@ describe('what an agent may send', () => {
     expect(seen!.body).toMatchObject({ memory: '2048', description: '12', cores: '4' });
   });
 
-  it('takes a number for an enum made of digits, and refuses what the enum does not hold', () => {
+  it('takes a number for an enum made of digits, and refuses what the enum does not hold', async () => {
     const digits = catalog.endpoints.flatMap((e) =>
       Object.entries(e.params)
-        .filter(([name, p]) => p.type === 'string' && p.enum?.some((v) => /^\d+$/.test(v)) && byName.get(toolName(e.method, e.path))?.input[name])
-        .map(([name, p]) => ({ schema: byName.get(toolName(e.method, e.path))!.input[name] as z.ZodType, value: Number(p.enum!.find((v) => /^\d+$/.test(v))) })),
+        .filter(([name, p]) => p.type === 'string' && p.enum?.some((v) => /^\d+$/.test(v)) && announced.tools.has(`${e.method} ${e.path}`) && def(e.method, e.path).inputSchema.properties[name])
+        .map(([name, p]) => ({ e, name, value: Number(p.enum!.find((v) => /^\d+$/.test(v))) })),
     );
     expect(digits.length).toBeGreaterThan(0);
-    for (const { schema, value } of digits) {
-      expect(schema.safeParse(value).success).toBe(true);
-      expect(schema.safeParse('no-such-value').success).toBe(false);
+    for (const { e, name, value } of digits) {
+      expect(await accepts(e.method, e.path, { [name]: value }, true), `${e.method} ${e.path} ${name}`).toBe(true);
+      expect(await accepts(e.method, e.path, { [name]: 'no-such-value' }, true), `${e.method} ${e.path} ${name}`).toBe(false);
     }
-    const flag = def('PUT', '/cluster/ceph/flags/{flag}').input.flag as z.ZodType;
-    expect(flag.safeParse('noout').success).toBe(true);
-    expect(flag.safeParse('nope').success).toBe(false);
+    const flag = '/cluster/ceph/flags/{flag}';
+    expect(await accepts('PUT', flag, { flag: 'noout' }, true)).toBe(true);
+    expect(await accepts('PUT', flag, { flag: 'nope' }, true)).toBe(false);
   });
 
   it('takes a single value for a list, and 100,101 for a list of ids', async () => {
@@ -323,10 +390,10 @@ describe('what an agent may send', () => {
     expect(items.seen!.body.redistribute).toBe('source=static');
   });
 
-  it('checks the items of a list against their enum', () => {
-    const schema = def('PUT', '/cluster/sdn/prefix-lists/{id}').input.delete as z.ZodType;
-    expect(schema.safeParse(['entries']).success).toBe(findEndpoint('PUT', '/cluster/sdn/prefix-lists/{id}')!.params.delete!.items!.enum!.includes('entries'));
-    expect(schema.safeParse(['no-such-field']).success).toBe(false);
+  it('checks the items of a list against their enum', async () => {
+    const template = '/cluster/sdn/prefix-lists/{id}';
+    expect(await accepts('PUT', template, { delete: ['entries'] }, true)).toBe(findEndpoint('PUT', template)!.params.delete!.items!.enum!.includes('entries'));
+    expect(await accepts('PUT', template, { delete: ['no-such-field'] }, true)).toBe(false);
   });
 
   it('takes a number as the value of a numbered parameter and of a flat one', async () => {
@@ -345,23 +412,22 @@ describe('what an agent may send', () => {
 
   it('accepts names with unusual characters in a node and in the values of a path', async () => {
     for (const node of ['pve1', 'pve-1', 'PVE', 'a.b.example', '1node']) {
-      expect((def('GET', '/nodes/{node}/status').input.node as z.ZodType).safeParse(node).success, node).toBe(true);
+      expect(await accepts('GET', '/nodes/{node}/status', { node }), node).toBe(true);
     }
-    expect((def('GET', '/nodes/{node}/status').input.node as z.ZodType).safeParse('../x').success).toBe(false);
+    expect(await accepts('GET', '/nodes/{node}/status', { node: '../x' })).toBe(false);
     const { res, seen } = await send('GET', '/nodes/{node}/storage/{storage}/content/{volume}', { node: 'pve1', storage: 'local', volume: 'local:iso/my file.iso' });
     expect(res.isError, res.text).toBe(false);
     expect(seen!.pathParams.volume).toBe('local:iso/my file.iso');
   });
 
-  it('applies no pattern on the client: the value may be valid in a version newer than the schema', () => {
+  it('applies no pattern on the client: the value may be valid in a version newer than the schema', async () => {
     const patterned = catalog.endpoints.flatMap((e) => Object.entries(e.params).filter(([, p]) => p.pattern && !p.enum && p.type === 'string').map(([name]) => ({ e, name })));
     expect(patterned.length).toBeGreaterThan(0);
     for (const { e, name } of patterned) {
       if (templateParams(e.path).includes(name) || name.endsWith('[n]')) continue;
-      const schema = byName.get(toolName(e.method, e.path))?.input[name] as z.ZodType | undefined;
-      if (!schema) continue;
+      if (!announced.tools.has(`${e.method} ${e.path}`) || !def(e.method, e.path).inputSchema.properties[name]) continue;
       const min = e.params[name]!.minLength ?? 1;
-      expect(schema.safeParse('~'.repeat(Math.max(min, 1))).success, `${e.method} ${e.path} ${name}`).toBe(true);
+      expect(await accepts(e.method, e.path, { [name]: '~'.repeat(Math.max(min, 1)) }, true), `${e.method} ${e.path} ${name}`).toBe(true);
     }
   });
 
@@ -448,7 +514,7 @@ describe('the schema a client is shown', () => {
     expect(of('POST', '/cluster/bulk-action/guest/start').properties.vms).toMatchObject({ type: 'array', items: { type: 'integer' } });
     expect(of('PUT', '/cluster/sdn/prefix-lists/{id}').properties.delete.items.enum.length).toBeGreaterThan(0);
 
-    for (const t of tools.filter((tool) => byName.has(tool.name))) {
+    for (const t of tools.filter((tool) => generatedNames.has(tool.name))) {
       const text = JSON.stringify(t.inputSchema);
       expect(text, t.name).not.toContain('"~standard"');
       for (const property of Object.values((t.inputSchema as any).properties ?? {}) as any[]) {
@@ -517,14 +583,17 @@ describe('the schema a client is shown', () => {
     expect(def('POST', '/storage').description).not.toContain('reach the host');
   });
 
-  it('puts tools in every domain that needs them', () => {
-    expect(domainOf('/nodes/{node}/aplinfo')).toEqual({ domain: 'storage', also: ['lxc'] });
-    expect(domainOf('/nodes/{node}/dns')).toEqual({ domain: 'node', also: ['network'] });
-    expect(domainOf('/nodes/{node}/hosts')).toEqual({ domain: 'node', also: ['network'] });
-    expect(domainOf('/nodes/{node}/storage/{storage}/content')).toEqual({ domain: 'storage', also: ['backup'] });
-    expect(domainOf('/nodes/{node}/storage/{storage}/content/{volume}')).toEqual({ domain: 'storage', also: ['backup'] });
-    expect(domainOf('/nodes/{node}/storage/{storage}/status')).toEqual({ domain: 'storage' });
-    expect(domainOf('/nodes/{node}/time')).toEqual({ domain: 'node' });
+  it('puts tools in every domain that needs them', async () => {
+    // The exact domains are checked in src/tools/naming.rs; here, what a toolset filter shows.
+    const lxc = await (await connect({ env: { PROXMOX_TOOLSETS: 'lxc' } })).toolNames();
+    expect(lxc).toContain(toolName('GET', '/nodes/{node}/aplinfo'));
+    const network = await (await connect({ env: { PROXMOX_TOOLSETS: 'network' } })).toolNames();
+    expect(network).toContain(toolName('GET', '/nodes/{node}/dns'));
+    expect(network).toContain(toolName('GET', '/nodes/{node}/hosts'));
+    expect(network).not.toContain(toolName('GET', '/nodes/{node}/time'));
+    const backup = await (await connect({ env: { PROXMOX_TOOLSETS: 'backup' } })).toolNames();
+    expect(backup).toContain(toolName('GET', '/nodes/{node}/storage/{storage}/content'));
+    expect(backup).not.toContain(toolName('GET', '/nodes/{node}/storage/{storage}/status'));
   });
 });
 
@@ -660,7 +729,7 @@ describe('what a write leaves behind', () => {
   it('does not write them to the audit log either, and they do reach Proxmox', async () => {
     const file = join(tmpdir(), `pvemcp-generation-${process.pid}-${Date.now()}.log`);
     try {
-      const { call, fake, runtime } = await connect({ fake: { permissive: true }, env: { ...ALL_GATES, ...PASSWORD_LOGIN, PROXMOX_AUDIT_LOG: file, PROXMOX_TASK_WAIT_SECONDS: '0' } });
+      const { call, fake, client } = await connect({ fake: { permissive: true }, env: { ...ALL_GATES, ...PASSWORD_LOGIN, PROXMOX_AUDIT_LOG: file, PROXMOX_TASK_WAIT_SECONDS: '0' } });
       for (const [, method, template, args] of secrets) {
         const res = await call(toolName(method, template), args);
         expect(res.isError, `${method} ${template}: ${res.text}`).toBe(false);
@@ -668,7 +737,8 @@ describe('what a write leaves behind', () => {
       // By path, the same masks apply.
       const direct = await call('pve_api_write', { method: 'POST', path: '/nodes/pve1/qemu/100/agent/file-write', params: { file: '/etc/x', content: 'secretvalue' } });
       expect(direct.isError, direct.text).toBe(false);
-      await runtime.shutdown();
+      // Closing stdin stops the server; each audit line is written before its answer anyway.
+      await client.close();
       const log = readFileSync(file, 'utf8');
       expect(log.trim().split('\n').length).toBeGreaterThanOrEqual(secrets.length);
       expect(log).not.toContain('secretvalue');

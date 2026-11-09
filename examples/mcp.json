@@ -1,8 +1,7 @@
 {
   "mcpServers": {
     "proxmox": {
-      "command": "node",
-      "args": ["C:/chemin/vers/pvemcp/dist/index.js"],
+      "command": "C:/chemin/vers/pvemcp/target/release/pvemcp.exe",
       "env": {
         "PROXMOX_URL": "https://192.168.1.10:8006",
         "PROXMOX_CREDENTIALS_FILE": "C:/chemin/vers/pvemcp.token",

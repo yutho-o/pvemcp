@@ -1,0 +1,73 @@
+[
+ {
+  "name": "cluster_health_review",
+  "title": "Cluster health review",
+  "description": "Reviews the health of the cluster and reports findings, without changing anything."
+ },
+ {
+  "name": "troubleshoot_guest",
+  "title": "Troubleshoot a guest",
+  "description": "Finds out what is wrong with a VM or a container, without changing anything.",
+  "arguments": [
+   {
+    "name": "vmid",
+    "description": "The guest id.",
+    "required": true
+   },
+   {
+    "name": "symptom",
+    "description": "What goes wrong, in plain words.",
+    "required": false
+   }
+  ]
+ },
+ {
+  "name": "provision_lxc",
+  "title": "Provision a container",
+  "description": "Creates a container with pve_provision_lxc, after a dry run and your agreement.",
+  "arguments": [
+   {
+    "name": "hostname",
+    "description": "Host name of the new container.",
+    "required": true
+   },
+   {
+    "name": "template",
+    "description": "Template wanted, such as debian-12-standard.",
+    "required": false
+   },
+   {
+    "name": "requirements",
+    "description": "Anything else: size, network, node, software.",
+    "required": false
+   }
+  ]
+ },
+ {
+  "name": "safe_guest_change",
+  "title": "Safe guest change",
+  "description": "Makes a change to a guest with a snapshot first, a check after, and a rollback if it fails.",
+  "arguments": [
+   {
+    "name": "vmid",
+    "description": "The guest id.",
+    "required": true
+   },
+   {
+    "name": "change",
+    "description": "The change wanted, in plain words.",
+    "required": true
+   }
+  ]
+ },
+ {
+  "name": "backup_review",
+  "title": "Backup review",
+  "description": "Reviews what is backed up and what is not, without changing anything."
+ },
+ {
+  "name": "security_review",
+  "title": "Security review",
+  "description": "Reviews the security settings of the cluster and reports findings, without changing anything."
+ }
+]

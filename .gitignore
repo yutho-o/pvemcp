@@ -25,3 +25,6 @@ apikey*.txt
 
 # Audit logs hold what was changed, and on which guest
 *.jsonl
+
+# Rust build output
+target/

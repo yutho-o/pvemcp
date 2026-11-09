@@ -1,193 +1,157 @@
+// Tasks and node resolution, through the tools of the Rust binary. The cases that need a clock or
+// an API shaped by hand (back-off, timeouts in milliseconds, cache expiry, UPID parsing) are Rust
+// unit tests in src/proxmox/tasks.rs and src/proxmox/nodes.rs.
 import { afterEach, describe, expect, it } from 'vitest';
-import { loadConfig } from '../src/config.js';
-import { ProxmoxClient } from '../src/proxmox/client.js';
-import { ProxmoxError } from '../src/proxmox/errors.js';
-import { NodeResolver } from '../src/proxmox/nodes.js';
-import { DRY_RUN_UPID, isUpid, parseUpid, taskLogTail, waitForTask } from '../src/proxmox/tasks.js';
-import { FAKE_TOKEN, FakePve, type FakeOptions } from './fake-pve.js';
+import { FakePve, type FakeOptions } from './fake-pve.js';
+import { closeAll, connect, WRITES } from './harness.js';
 
-const cleanups: Array<() => unknown> = [];
-afterEach(async () => {
-  for (const c of cleanups.splice(0)) await c();
-});
+afterEach(closeAll);
 
-async function setup(options: FakeOptions = {}) {
+const DRY_RUN_UPID = 'UPID:dry-run:00000000:00000000:00000000:dryrun:0:dry-run@pam:';
+
+async function started(options: FakeOptions = {}) {
   const fake = new FakePve(options);
   await fake.start();
-  const config = loadConfig({ PROXMOX_URL: fake.url, PROXMOX_TOKEN: FAKE_TOKEN });
-  const client = new ProxmoxClient(config.instances.get('default')!);
-  cleanups.push(() => client.close(), () => fake.stop());
-  return { fake, client };
+  return fake;
 }
 
-const FAST = { pollMs: 1, maxPollMs: 2 };
-
-describe('UPID', () => {
-  const upid = 'UPID:pve1:0000A1B2:0012C3D4:5F9A1B2C:qmstart:100:root@pam:';
-
-  it('parses', () => {
-    expect(parseUpid(upid)).toEqual({ upid, node: 'pve1', pid: 0xa1b2, pstart: 0x12c3d4, starttime: 0x5f9a1b2c, type: 'qmstart', id: '100', user: 'root@pam' });
-    expect(parseUpid('UPID:n-1:00000001:00000002:00000003:vzdump::mcp@pve!tok:').id).toBe('');
-    expect(isUpid(upid)).toBe(true);
-    expect(isUpid(DRY_RUN_UPID)).toBe(true);
-  });
-
-  it.each(['', 'ok', 'UPID:', 'UPID:pve1:1:2:3:x:y:z:', `${upid}extra`, 'UPID:pve/1:0000A1B2:0012C3D4:5F9A1B2C:qmstart:100:root@pam:', 5, null])('refuses %s', (value) => {
-    expect(isUpid(value)).toBe(false);
-  });
-
-  it('throws invalid_input on a bad one', () => {
-    expect(() => parseUpid('nope')).toThrow(ProxmoxError);
-  });
-});
-
-describe('waitForTask', () => {
+describe('waiting for a task', () => {
   it('polls the node of the UPID until it stops, and returns the end of the log', async () => {
-    const { fake, client } = await setup({ nodes: ['pve1', 'pve2'] });
-    const upid = fake.startTask('pve2', 'qmstart', '100', { polls: 3, log: ['one', 'two', 'TASK OK'] });
-    const result = await waitForTask(client, upid, FAST);
-    expect(result).toEqual({ upid, node: 'pve2', status: 'stopped', exitstatus: 'OK', log_tail: ['one', 'two', 'TASK OK'] });
+    const fake = await started({ nodes: ['pve1', 'pve2'] });
+    const upid = fake.startTask('pve2', 'qmstart', '100', { polls: 2, log: ['one', 'two', 'TASK OK'] });
+    const { call } = await connect({ fake });
+    const res = await call('pve_wait_task', { upid });
+    expect(res.isError).toBe(false);
+    expect(res.data).toMatchObject({ upid, node: 'pve2', status: 'stopped', exitstatus: 'OK', log_tail: ['one', 'two', 'TASK OK'] });
     const reads = fake.find('GET', '/nodes/{node}/tasks/{upid}/status');
-    expect(reads).toHaveLength(4);
+    expect(reads).toHaveLength(3);
     expect(reads[0]!.pathParams.node).toBe('pve2');
     expect(reads[0]!.pathParams.upid).toBe(upid);
   });
 
   it('counts WARNINGS as a success with a warning', async () => {
-    const { fake, client } = await setup();
+    const fake = await started();
     const upid = fake.startTask('pve1', 'vzdump', '', { exitstatus: 'WARNINGS: 2' });
-    const result = await waitForTask(client, upid, FAST);
-    expect(result.exitstatus).toBe('WARNINGS: 2');
-    expect(result.warning).toContain('warnings: 2');
+    const res = await (await connect({ fake })).call('pve_wait_task', { upid });
+    expect(res.isError).toBe(false);
+    expect(res.data.exitstatus).toBe('WARNINGS: 2');
+    expect(res.data.warning).toContain('warnings: 2');
   });
 
   it('turns any other exit into task_failed, with the log tail', async () => {
-    const { fake, client } = await setup();
+    const fake = await started();
     const upid = fake.startTask('pve1', 'qmstart', '100', { exitstatus: 'command failed', log: ['boom', 'TASK ERROR: command failed'] });
-    const err = await waitForTask(client, upid, FAST).catch((e: unknown) => e as ProxmoxError);
-    expect(err).toBeInstanceOf(ProxmoxError);
-    expect((err as ProxmoxError).type).toBe('task_failed');
-    expect((err as ProxmoxError).details).toMatchObject({ exitstatus: 'command failed', log_tail: ['boom', 'TASK ERROR: command failed'] });
+    const res = await (await connect({ fake })).call('pve_wait_task', { upid });
+    expect(res.isError).toBe(true);
+    expect(res.data.error_type).toBe('task_failed');
+    expect(res.data.details).toMatchObject({ exitstatus: 'command failed', log_tail: ['boom', 'TASK ERROR: command failed'] });
   });
 
-  it('gives up with task_timeout when it outlasts the delay, without cancelling it', async () => {
-    const { fake, client } = await setup();
+  it('gives up when it outlasts the delay, without cancelling the task', async () => {
+    const fake = await started();
     const upid = fake.startTask('pve1', 'qmstart', '100', { polls: 100_000 });
-    const err = await waitForTask(client, upid, { ...FAST, timeoutMs: 30 }).catch((e: unknown) => e as ProxmoxError);
-    expect((err as ProxmoxError).type).toBe('task_timeout');
+    const res = await (await connect({ fake })).call('pve_wait_task', { upid, wait_seconds: 1 });
+    expect(JSON.stringify(res.data)).toMatch(/still_running|task_timeout/);
     expect(fake.tasks.get(upid)!.stopped).toBe(false);
     expect(fake.writes()).toHaveLength(0);
   });
 
-  it('backs off between polls', async () => {
-    const delays: number[] = [];
-    let last = Date.now();
-    let polls = 0;
-    const api = {
-      get: async (path: string) => {
-        if (path.endsWith('/log')) return [];
-        const now = Date.now();
-        delays.push(now - last);
-        last = now;
-        return polls++ < 4 ? { status: 'running' } : { status: 'stopped', exitstatus: 'OK' };
-      },
-    };
-    await waitForTask(api, 'UPID:pve1:00000001:00000002:00000003:x:y:z@pam:', { pollMs: 10, maxPollMs: 40 });
-    expect(delays.at(-1)!).toBeGreaterThan(delays[1]! - 5);
-  });
-
-  it('stops on abort', async () => {
-    const { fake, client } = await setup();
-    const upid = fake.startTask('pve1', 'qmstart', '100', { polls: 100_000 });
-    const controller = new AbortController();
-    const waiting = waitForTask(client, upid, { pollMs: 1000, timeoutMs: 60_000, signal: controller.signal });
-    setTimeout(() => controller.abort(new Error('stop waiting')), 20);
-    await expect(waiting).rejects.toThrow('stop waiting');
-  });
-
   it('never touches the API for the dry-run task', async () => {
-    const { fake, client } = await setup();
-    const result = await waitForTask(client, DRY_RUN_UPID);
-    expect(result.exitstatus).toBe('OK');
+    const fake = await started();
+    const res = await (await connect({ fake })).call('pve_wait_task', { upid: DRY_RUN_UPID });
+    expect(res.data.exitstatus).toBe('OK');
     expect(fake.requests).toHaveLength(0);
   });
 
   it('reports an API failure while polling as it is', async () => {
-    const { fake, client } = await setup();
-    const err = await waitForTask(client, fake.startTask('pve1', 'x', 'y').replace('pve1', 'gone'), FAST).catch((e: unknown) => e as ProxmoxError);
-    expect((err as ProxmoxError).type).toBe('upstream_error');
+    const fake = await started();
+    const upid = fake.startTask('pve1', 'x', 'y').replace('pve1', 'gone');
+    const res = await (await connect({ fake })).call('pve_wait_task', { upid });
+    expect(res.data.error_type).toBe('upstream_error');
+  });
+
+  it('refuses something that is not a UPID', async () => {
+    const res = await (await connect()).call('pve_wait_task', { upid: 'nope' });
+    expect(res.data.error_type).toBe('invalid_input');
+  });
+
+  it('waits for the task a write starts, through the scope of the call', async () => {
+    const fake = await started({ nodes: ['pve1', 'pve2'], guests: [{ vmid: 100, node: 'pve2', type: 'qemu', status: 'stopped' }] });
+    const res = await (await connect({ fake, env: WRITES })).call('pve_start_vm', { vmid: 100 });
+    expect(res.isError).toBe(false);
+    expect(res.data).toMatchObject({ node: 'pve2', status: 'stopped', exitstatus: 'OK' });
   });
 });
 
-describe('taskLogTail', () => {
+describe('the task log tail', () => {
   it('keeps the last lines, and survives an unreadable log', async () => {
-    const { fake, client } = await setup();
+    const fake = await started();
     const upid = fake.startTask('pve1', 'x', 'y', { log: Array.from({ length: 30 }, (_, i) => `line ${i}`) });
-    expect(await taskLogTail(client, upid, 2)).toEqual(['line 28', 'line 29']);
-    expect(await taskLogTail(client, upid.replace('pve1', 'gone'))).toEqual([]);
+    const { call } = await connect({ fake });
+    expect((await call('pve_get_task_log_tail', { upid, lines: 2 })).data.log_tail).toEqual(['line 28', 'line 29']);
+    const unreadable = await call('pve_get_task_log_tail', { upid: upid.replace('pve1', 'gone'), lines: 2 });
+    expect(unreadable.isError).toBe(true);
+    expect(unreadable.text).not.toContain('line 2');
   });
 
   it('pages through a log longer than one read', async () => {
-    const { fake, client } = await setup();
+    const fake = await started();
     const upid = fake.startTask('pve1', 'x', 'y', { log: Array.from({ length: 12_000 }, (_, i) => `line ${i}`) });
-    expect(await taskLogTail(client, upid, 1)).toEqual(['line 11999']);
+    const res = await (await connect({ fake })).call('pve_get_task_log_tail', { upid, lines: 1 });
+    expect(JSON.stringify(res.data)).toContain('"line 11999"');
+    expect(JSON.stringify(res.data)).not.toContain('"line 11998"');
   });
 });
 
-describe('NodeResolver', () => {
-  async function resolver(options: FakeOptions = {}, resolverOptions: Partial<ConstructorParameters<typeof NodeResolver>[1]> = {}) {
-    const { fake, client } = await setup(options);
-    const nodes = new NodeResolver(client, { apiHost: 'api.example', ...resolverOptions });
-    return { fake, nodes };
-  }
-
-  it('finds a guest, and caches the answer', async () => {
-    const { fake, nodes } = await resolver({ nodes: ['pve1', 'pve2'], guests: [{ vmid: 100, node: 'pve2', type: 'lxc', name: 'db', status: 'stopped' }] });
-    expect(await nodes.resolveGuest(100)).toEqual({ vmid: 100, node: 'pve2', type: 'lxc', name: 'db', status: 'stopped' });
-    await nodes.resolveGuest(100);
-    expect(fake.find('GET', '/cluster/resources')).toHaveLength(1);
-    expect(fake.find('GET', '/cluster/resources')[0]!.query.type).toBe('vm');
+describe('finding guests and nodes', () => {
+  it('finds the node of a guest from its vmid, and caches the answer', async () => {
+    const fake = await started({ nodes: ['pve1', 'pve2'], guests: [{ vmid: 100, node: 'pve2', type: 'lxc', name: 'db', status: 'stopped' }] });
+    const { call } = await connect({ fake });
+    expect((await call('pve_get_lxc_status', { vmid: 100 })).isError).toBe(false);
+    expect((await call('pve_get_lxc_config', { vmid: 100 })).isError).toBe(false);
+    const reads = fake.find('GET', '/cluster/resources');
+    expect(reads).toHaveLength(1);
+    expect(reads[0]!.query.type).toBe('vm');
+    expect(fake.find('GET', '/nodes/{node}/lxc/{vmid}/status/current')[0]!.pathParams.node).toBe('pve2');
   });
 
-  it('reads again after invalidate, and after the cache expires', async () => {
-    const { fake, nodes } = await resolver();
-    await nodes.resolveGuest(100);
-    fake.guests.get(100)!.node = 'pve1';
-    nodes.invalidate();
-    await nodes.resolveGuest(100);
+  it('reads again after a write, since the guest may have moved', async () => {
+    const fake = await started({ guests: [{ vmid: 100, type: 'qemu', status: 'stopped' }] });
+    const { call } = await connect({ fake, env: WRITES });
+    await call('pve_get_vm_status', { vmid: 100 });
+    await call('pve_start_vm', { vmid: 100, wait: false });
+    await call('pve_get_vm_status', { vmid: 100 });
     expect(fake.find('GET', '/cluster/resources')).toHaveLength(2);
-
-    const quick = await resolver({}, { cacheMs: 0 });
-    await quick.nodes.resolveGuest(100);
-    await quick.nodes.resolveGuest(100);
-    expect(quick.fake.find('GET', '/cluster/resources')).toHaveLength(2);
   });
 
   it('looks again before saying that a guest does not exist', async () => {
-    const { fake, nodes } = await resolver();
-    await nodes.resolveGuest(100);
+    const fake = await started();
+    const { call } = await connect({ fake });
+    await call('pve_get_vm_status', { vmid: 100 });
     fake.addGuest({ vmid: 300 });
-    expect((await nodes.resolveGuest(300)).vmid).toBe(300);
-    const err = await nodes.resolveGuest(999).catch((e: unknown) => e as ProxmoxError);
-    expect((err as ProxmoxError).type).toBe('not_found');
+    expect((await call('pve_get_vm_status', { vmid: 300 })).isError).toBe(false);
+    expect((await call('pve_get_vm_status', { vmid: 999 })).data.error_type).toBe('not_found');
+  });
+
+  it('says which tool it is for when the vmid is of the other kind', async () => {
+    const fake = await started({ guests: [{ vmid: 101, type: 'lxc' }] });
+    const res = await (await connect({ fake })).call('pve_get_vm_status', { vmid: 101 });
+    expect(res.data.error_type).toBe('invalid_input');
+    expect(res.data.error).toContain('container');
   });
 
   it('uses the default node, else the only one, else lists them', async () => {
-    expect(await (await resolver({ nodes: ['a', 'b'] }, { defaultNode: 'b' })).nodes.defaultNode()).toBe('b');
-    expect(await (await resolver({ nodes: ['only'], guests: [] })).nodes.defaultNode()).toBe('only');
-    const err = await (await resolver({ nodes: ['a', 'b'], guests: [] })).nodes.defaultNode().catch((e: unknown) => e as ProxmoxError);
-    expect((err as ProxmoxError).type).toBe('invalid_input');
-    expect((err as ProxmoxError).message).toContain('a, b');
-  });
+    const two = await started({ nodes: ['a', 'b'], guests: [] });
+    expect((await (await connect({ fake: two, env: { PROXMOX_DEFAULT_NODE: 'b' } })).call('pve_get_node_status')).isError).toBe(false);
+    expect(two.find('GET', '/nodes/{node}/status').at(-1)!.pathParams.node).toBe('b');
 
-  it('finds the SSH host: pinned, else from the cluster, else the API host on one node', async () => {
-    const pinned = await resolver({ nodes: ['a', 'b'] }, { sshNodes: { a: '10.0.0.1' } });
-    expect(await pinned.nodes.sshHost('a')).toBe('10.0.0.1');
-    expect(await pinned.nodes.sshHost('b')).toBe('192.0.2.2');
-    await expect(pinned.nodes.sshHost('c')).rejects.toThrow(/No address known/);
+    const one = await started({ nodes: ['only'], guests: [] });
+    expect((await (await connect({ fake: one })).call('pve_get_node_status')).isError).toBe(false);
+    expect(one.find('GET', '/nodes/{node}/status')[0]!.pathParams.node).toBe('only');
 
-    const single = await resolver();
-    single.fake.on('GET', '/cluster/status', () => [{ type: 'cluster', name: 'x' }, { type: 'node', name: 'pve1' }]);
-    expect(await single.nodes.sshHost('pve1')).toBe('api.example');
+    const several = await started({ nodes: ['a', 'b'], guests: [] });
+    const res = await (await connect({ fake: several })).call('pve_get_node_status');
+    expect(res.data.error_type).toBe('invalid_input');
+    expect(res.data.error).toContain('a, b');
   });
 });

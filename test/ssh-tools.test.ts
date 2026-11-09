@@ -2,7 +2,6 @@ import { readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SshSessions } from '../src/ssh/sessions.js';
 import { FAKE_SSH_PASSWORD, FakeSsh, generateKey, ShellSandbox } from './fake-ssh.js';
 import { closeSsh, connectSsh, POSIX_SHELL, tempDir, type ConnectSshOptions, type SshHarness } from './ssh-harness.js';
 
@@ -807,39 +806,6 @@ describe('PTY sessions', () => {
     await open(h);
   });
 
-  it('closes a session left idle', async () => {
-    const h = await connectSsh();
-    h.runtime.state('ssh-sessions', () => new SshSessions({ idleMs: 60 }));
-    const session = await open(h);
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    expect((await h.call('pve_ssh_session_read', { session })).data.error_type).toBe('not_found');
-    await vi.waitFor(() => expect((h.ssh as unknown as { clients: Set<unknown> }).clients.size).toBe(0));
-  });
-
-  it('a program printing on its own does not count as use', async () => {
-    const sessions = new SshSessions({ idleMs: 80 });
-    const h = await connectSsh();
-    h.runtime.state('ssh-sessions', () => sessions);
-    await open(h);
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(sessions.list('default')).toEqual([]);
-  });
-
-  it('drops the oldest output past the ring size, and says how much', async () => {
-    const h = await connectSsh();
-    h.runtime.state('ssh-sessions', () => new SshSessions({ bufferBytes: 1024 }));
-    const session = await open(h);
-    await h.call('pve_ssh_session_send', { session, input: 'flood 5000\n' });
-    await vi.waitFor(async () => {
-      expect((await h.call('pve_ssh_session_list')).data.rows[0].unread_bytes).toBe(1024);
-    });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const res = await h.call('pve_ssh_session_read', { session });
-    expect(res.data.dropped_bytes).toBeGreaterThan(3900);
-    expect(res.data.output.length).toBeLessThanOrEqual(1024);
-    expect(res.data.output).toContain('fake#');
-  });
-
   it('keeps a character cut across two reads whole', async () => {
     const h = await connectSsh();
     const session = await open(h);
@@ -851,7 +817,8 @@ describe('PTY sessions', () => {
     const h = await connectSsh();
     await open(h);
     await open(h);
-    await h.runtime.shutdown();
+    // Closing stdin stops the server, which closes its sessions on the way out.
+    await h.client.close();
     await vi.waitFor(() => expect((h.ssh as unknown as { clients: Set<unknown> }).clients.size).toBe(0));
   });
 

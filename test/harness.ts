@@ -1,10 +1,37 @@
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { loadConfig, type Env } from '../src/config.js';
-import { Runtime, type RuntimeOptions } from '../src/runtime.js';
-import { createServer } from '../src/server.js';
 import { FAKE_TOKEN, FakePve, type FakeOptions } from './fake-pve.js';
+
+export type Env = Record<string, string | undefined>;
+
+/** The Rust binary under test: PVEMCP_BIN, else the release build, else the debug build. */
+export function binary(): string {
+  if (process.env.PVEMCP_BIN) return process.env.PVEMCP_BIN;
+  const exe = process.platform === 'win32' ? 'pvemcp.exe' : 'pvemcp';
+  const root = join(import.meta.dirname, '..', 'target');
+  for (const build of ['release', 'debug']) {
+    const path = join(root, build, exe);
+    if (existsSync(path)) return path;
+  }
+  throw new Error('No pvemcp binary: run cargo build first, or set PVEMCP_BIN.');
+}
+
+/** What pvemcp --list-tools prints for this environment: every tool it would show, with its domain and gate. */
+export function listTools(env: Env): Array<{ domain: string; gate: string; name: string }> {
+  const run = spawnSync(binary(), ['--list-tools'], { env: { ...getDefaultEnvironment(), PROXMOX_URL: 'https://127.0.0.1:8006', PROXMOX_TOKEN: FAKE_TOKEN, ...env }, encoding: 'utf8' });
+  if (run.status !== 0) throw new Error(`pvemcp --list-tools failed: ${run.stderr}`);
+  return run.stdout
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      const [domain, gate, name] = line.split('\t') as [string, string, string];
+      return { domain, gate, name };
+    });
+}
 
 /** Everything the last connect() calls set up. Call closeAll() in afterEach. */
 const cleanups: Array<() => Promise<unknown> | unknown> = [];
@@ -22,7 +49,8 @@ export async function closeAll(): Promise<void> {
 export interface Harness {
   fake: FakePve;
   client: Client;
-  runtime: Runtime;
+  /** What the server wrote on stderr so far. */
+  stderr: () => string;
   /** Calls a tool through a real MCP client. data is the parsed JSON text of the answer. */
   call: (name: string, args?: Record<string, unknown>) => Promise<{ data: Record<string, any>; isError: boolean; text: string }>;
   toolNames: () => Promise<string[]>;
@@ -34,10 +62,29 @@ export interface ConnectOptions {
   env?: Env;
   /** Makes the client advertise elicitation and answer with this. */
   onElicit?: (message: string) => { action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> };
-  runtime?: RuntimeOptions;
 }
 
-/** Fake Proxmox, real runtime, real MCP server and client over an in-memory transport. */
+/** Starts the binary over stdio with this environment, and connects a real MCP client to it. */
+export async function spawnServer(env: Env, onElicit?: ConnectOptions['onElicit']): Promise<{ client: Client; stderr: () => string }> {
+  const clean: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) if (v !== undefined) clean[k] = v;
+  const transport = new StdioClientTransport({ command: binary(), args: [], env: clean, stderr: 'pipe' });
+  let errors = '';
+  transport.stderr?.on('data', (chunk: Buffer) => {
+    errors += chunk.toString();
+  });
+  const client = new Client({ name: 'test', version: '1' }, { capabilities: onElicit ? { elicitation: { form: {} } } : {} });
+  if (onElicit) client.setRequestHandler(ElicitRequestSchema, (req) => onElicit(req.params.message));
+  try {
+    await client.connect(transport);
+  } catch (err) {
+    throw new Error(`${(err as Error).message}\n${errors}`);
+  }
+  cleanups.push(() => client.close());
+  return { client, stderr: () => errors };
+}
+
+/** Fake Proxmox, the real server binary, and a real MCP client over stdio. */
 export async function connect(opts: ConnectOptions = {}): Promise<Harness> {
   let fake: FakePve;
   if (opts.fake instanceof FakePve) {
@@ -46,20 +93,12 @@ export async function connect(opts: ConnectOptions = {}): Promise<Harness> {
     fake = new FakePve(opts.fake);
     await fake.start();
   }
-  const runtime = new Runtime(loadConfig({ PROXMOX_URL: fake.url, PROXMOX_TOKEN: FAKE_TOKEN, ...opts.env }), opts.runtime);
-  const server = createServer(runtime);
-  const client = new Client({ name: 'test', version: '1' }, { capabilities: opts.onElicit ? { elicitation: { form: {} } } : {} });
-  if (opts.onElicit) {
-    const handler = opts.onElicit;
-    client.setRequestHandler(ElicitRequestSchema, (req) => handler(req.params.message));
-  }
-  const [a, b] = InMemoryTransport.createLinkedPair();
-  await Promise.all([server.connect(a), client.connect(b)]);
-  cleanups.push(() => client.close(), () => server.close(), () => runtime.shutdown(), () => fake.stop());
+  const { client, stderr } = await spawnServer({ PROXMOX_URL: fake.url, PROXMOX_TOKEN: FAKE_TOKEN, ...opts.env }, opts.onElicit);
+  cleanups.push(() => fake.stop());
   return {
     fake,
     client,
-    runtime,
+    stderr,
     call: async (name, args = {}) => {
       const res = (await client.callTool({ name, arguments: args })) as { content: Array<{ text: string }>; isError?: boolean };
       const text = res.content[0]!.text;
@@ -67,7 +106,7 @@ export async function connect(opts: ConnectOptions = {}): Promise<Harness> {
       try {
         data = JSON.parse(text);
       } catch {
-        // Argument validation by the SDK answers in plain text.
+        // Argument validation answers in plain text.
         data = { text };
       }
       return { data, isError: res.isError === true, text };
@@ -85,7 +124,7 @@ export const ALL_GATES: Env = {
   PROXMOX_ALLOW_GUEST_EXEC: 'true',
   PROXMOX_ALLOW_SENSITIVE: 'true',
   PROXMOX_ALLOW_SSH: 'true',
-  // SSH refuses to start without a credential. Nothing connects unless a test gives a transport.
+  // SSH refuses to start without a credential. Nothing connects unless a test gives a host.
   PROXMOX_SSH_PASSWORD: 'unused',
   PROXMOX_TOOLSETS: 'all',
 };

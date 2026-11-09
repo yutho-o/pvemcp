@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Env } from '../src/config.js';
+import type { Env } from './harness.js';
 import { closeAll, connect, type ConnectOptions, type Harness } from './harness.js';
 import { FAKE_SSH_PASSWORD, FakeSsh, findPosixShell, ShellSandbox, type FakeSshOptions, type PosixShell } from './fake-ssh.js';
 import type { FakeOptions } from './fake-pve.js';

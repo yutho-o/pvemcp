@@ -1,11 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
-import { allTools } from '../src/tools/index.js';
-import { sshLxcTools } from '../src/tools/ssh-lxc.js';
-import { sshNodeTools } from '../src/tools/ssh-node.js';
-import { workflowTools } from '../src/tools/workflows.js';
 import { FakePve, pveError, Reply } from './fake-pve.js';
-import { ALL_GATES, closeAll, connect, WRITES } from './harness.js';
+import { ALL_GATES, closeAll, connect, listTools, WRITES } from './harness.js';
 
 afterEach(closeAll);
 
@@ -113,12 +109,10 @@ async function healthyCluster(): Promise<FakePve> {
 
 describe('the workflow tools as a whole', () => {
   it('has every tool of the design, with its own name', () => {
-    const names = workflowTools().map((t) => t.name);
+    const all = listTools(ALL_GATES);
+    const names = all.filter((t) => t.domain === 'workflows').map((t) => t.name);
     expect(names.sort()).toEqual([...WORKFLOW_NAMES].sort());
-    const others = allTools(() => ({}))
-      .filter((t) => t.domain !== 'workflows')
-      .map((t) => t.name);
-    for (const name of names) expect(others).not.toContain(name);
+    expect(new Set(all.map((t) => t.name)).size).toBe(all.length);
   });
 
   it('shows only the read tools on a read-only server', async () => {
@@ -152,11 +146,8 @@ describe('the workflow tools as a whole', () => {
   });
 
   it('never points at a tool that does not exist', () => {
-    const known = new Set(allTools(() => ({})).map((t) => t.name));
-    // The SSH tools named in prompts, while their files are still being filled in.
-    if (sshLxcTools().length === 0) for (const n of ['pve_lxc_info', 'pve_lxc_logs', 'pve_lxc_service_status']) known.add(n);
-    if (sshNodeTools().length === 0) for (const n of ['pve_ssh_journal', 'pve_ssh_host_diagnostics']) known.add(n);
-    for (const file of ['../src/tools/workflows.ts', '../src/prompts.ts']) {
+    const known = new Set(listTools(ALL_GATES).map((t) => t.name));
+    for (const file of ['../src/tools/workflows.rs', '../src/prompts.rs']) {
       const text = readFileSync(new URL(file, import.meta.url), 'utf8');
       const mentioned = [...new Set(text.match(/\bpve_[a-z0-9_]+/g) ?? [])].filter((n) => !n.endsWith('_'));
       const missing = mentioned.filter((n) => !known.has(n));
